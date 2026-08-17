@@ -53,10 +53,16 @@ final class ZoomProbeMathTests: XCTestCase {
             XCTFail("crop returned nil")
             return
         }
-        // We can't easily check the dimensions of the cropped JPEG without decoding, but
-        // it should be non-empty and smaller than the source (a 1/5 crop yields a ~40×40 image).
+        // Byte count is no proxy for dimensions on tiny synthetic JPEGs (encoder
+        // overhead dominates and a recompressed crop can be BIGGER than the
+        // source). Assert the decoded pixel dimensions instead: 128 / 5 ≈ 25.
         XCTAssertGreaterThan(cropped.count, 0)
-        XCTAssertLessThan(cropped.count, g.count)
+        // (centerCrop clamps to a ~40px floor, so assert "strictly smaller
+        // than the source frame," not an exact 128/5.)
+        let (w, h) = LiveView.parseJPEGDimensions(cropped)
+        let (sw, sh) = LiveView.parseJPEGDimensions(g)
+        XCTAssertTrue((w ?? 0) > 0 && (w ?? 0) < (sw ?? 0), "cropped width \(w ?? 0) vs source \(sw ?? 0)")
+        XCTAssertTrue((h ?? 0) > 0 && (h ?? 0) < (sh ?? 0), "cropped height \(h ?? 0) vs source \(sh ?? 0)")
     }
 
     func testJPEGCropDivisor1ReturnsOriginal() {

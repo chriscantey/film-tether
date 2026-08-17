@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Camera
+import Scan
 
 /// Wraps an NSImageView for the live-view stream, SwiftUI's `Image` repaint cycle is too
 /// slow for a 10fps JPEG stream. Falls back to a placeholder when not streaming.
@@ -14,18 +15,34 @@ import Camera
 /// menu item. Drag-to-move and per-shot persistence are follow-ups.
 struct LiveViewPane: View {
     @EnvironmentObject var model: AppModel
+    @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
         ZStack {
-            // 3:2 aspect-ratio constraint so the pane letterboxes inside the
-            // available space instead of cropping.
+            // Aspect-ratio constraint so the pane letterboxes inside the
+            // available space instead of cropping. 3:2 normally, 2:3 when the
+            // preview is rotated a quarter turn.
             ImagePaneRepresentable()
-                .aspectRatio(3.0 / 2.0, contentMode: .fit)
-            // Interaction layer ONLY, same 3:2 rect as the image. The visible
+                .aspectRatio(model.previewAspectRatio, contentMode: .fit)
+                .background(paneSizeReporter())
+            // Eyedropper takes over the whole pane while armed, so a click
+            // samples white balance instead of moving the metering box. It
+            // outranks the metering layer deliberately: the two would otherwise
+            // fight over the same click.
+            if model.isPickingWhiteBalance && model.isLiveViewOn {
+                EyedropperLayer { display in
+                    // Un-rotate so the sample comes from the pixel that
+                    // was actually under the crosshair.
+                    let s = model.previewRotation.sensorPoint(fromDisplay: display)
+                    model.sampleWhiteBalance(atSensor: s)
+                }
+                .aspectRatio(model.previewAspectRatio, contentMode: .fit)
+            }
+            // Interaction layer ONLY, same rect as the image. The visible
             // box is composited into the frame (AppModel.drawZoomBox), always
             // shown while the overlay toggle is on (no fade). Click OR drag
             // anywhere to zip the box (zoom target), centered, to that point.
-            if model.showMeteringOverlay && model.isLiveViewOn && model.zoomMode == .fit {
+            else if model.showMeteringOverlay && model.isLiveViewOn && model.zoomMode == .fit {
                 GeometryReader { geo in
                     Color.clear
                         .contentShape(Rectangle())
@@ -33,17 +50,92 @@ struct LiveViewPane: View {
                             DragGesture(minimumDistance: 0)   // 0 → a plain click also fires this
                                 .onChanged { value in
                                     let f = AppModel.zoomBoxFraction
-                                    let cx = value.location.x / max(geo.size.width, 1)
-                                    let cy = value.location.y / max(geo.size.height, 1)
+                                    // The gesture reports a point in the ROTATED
+                                    // view; meteringCenter is sensor space, so
+                                    // un-rotate before clamping (clamping in the
+                                    // wrong space would pin the wrong edges).
+                                    let display = CGPoint(
+                                        x: value.location.x / max(geo.size.width, 1),
+                                        y: value.location.y / max(geo.size.height, 1)
+                                    )
+                                    let s = model.previewRotation.sensorPoint(fromDisplay: display)
                                     // Box centered on the click/drag point, clamped so it
                                     // stays fully in frame and can reach every edge.
-                                    let nx = min(max(cx, f/2), 1 - f/2)
-                                    let ny = min(max(cy, f/2), 1 - f/2)
+                                    let nx = min(max(s.x, f/2), 1 - f/2)
+                                    let ny = min(max(s.y, f/2), 1 - f/2)
                                     model.meteringCenter = CGPoint(x: nx, y: ny)
                                 }
                         )
                 }
+                .aspectRatio(model.previewAspectRatio, contentMode: .fit)
+            }
+            // Live histogram card: corner overlay, snap-drag, hides while
+            // zoomed (zoom is for focus; the card would cover the detail).
+            if UIPreview.on || (settings.histogramEnabled && model.isLiveViewOn && model.zoomMode == .fit),
+               let hist = model.histogramData ?? (UIPreview.on ? .sample : nil) {
+                GeometryReader { geo in
+                    HistogramOverlay(data: hist,
+                                     corner: $settings.histogramCorner,
+                                     paneSize: geo.size)
+                }
                 .aspectRatio(3.0 / 2.0, contentMode: .fit)
+            }
+        }
+    }
+
+    /// Publishes the pane's laid-out size to the model so the zoom button can
+    /// show a real "Fit (N%)". It has to come from actual geometry: the number
+    /// changes with every window resize and every rotation.
+    private func paneSizeReporter() -> some View {
+        GeometryReader { geo in
+            Color.clear
+                .onChange(of: geo.size, initial: true) { _, newValue in
+                    guard model.previewPaneSize != newValue else { return }
+                    model.previewPaneSize = newValue
+                }
+        }
+    }
+}
+
+/// Click target for the white-balance eyedropper, showing a crosshair cursor so
+/// it's unambiguous which pixel is about to be sampled.
+///
+/// The crosshair is pushed on hover and popped on exit. `NSCursor.push()` is a
+/// *stack*, so an unbalanced pop leaks the cursor to the whole app, hence the
+/// `pushed` flag guarding both directions, plus the `onDisappear` cleanup. That
+/// last one is what actually matters in practice: taking a sample disarms the
+/// picker, so this view is usually torn down while the pointer is still inside
+/// it and no hover-exit ever arrives.
+private struct EyedropperLayer: View {
+    /// Called with the click position, normalized to the pane and y-down.
+    let onPick: (CGPoint) -> Void
+
+    @State private var pushed = false
+
+    var body: some View {
+        GeometryReader { geo in
+            Color.clear
+                .contentShape(Rectangle())
+                .onHover { inside in
+                    if inside, !pushed {
+                        NSCursor.crosshair.push()
+                        pushed = true
+                    } else if !inside, pushed {
+                        NSCursor.pop()
+                        pushed = false
+                    }
+                }
+                .onTapGesture { location in
+                    onPick(CGPoint(
+                        x: location.x / max(geo.size.width, 1),
+                        y: location.y / max(geo.size.height, 1)
+                    ))
+                }
+        }
+        .onDisappear {
+            if pushed {
+                NSCursor.pop()
+                pushed = false
             }
         }
     }
@@ -54,25 +146,34 @@ private struct ImagePaneRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> ImagePane {
         let pane = ImagePane()
-        // scaleProportionallyUpOrDown = always scale to fit, preserve aspect,
-        // never crop. Belt-and-suspenders: SwiftUI also gets an
-        // aspectRatio(3/2) constraint in LiveViewPane.body so the pane
-        // itself is letterboxed inside the available space rather than
-        // sized to whatever the parent provides. Together: never crop.
-        pane.imageScaling = .scaleProportionallyUpOrDown
         pane.imageAlignment = .alignCenter
         pane.wantsLayer = true
         pane.layer?.backgroundColor = NSColor.black.cgColor
+        // At 100% the image is routinely larger than the pane, so the overflow
+        // has to be clipped rather than drawn over the toolbar.
+        pane.layer?.masksToBounds = true
         return pane
     }
 
     func updateNSView(_ nsView: ImagePane, context: Context) {
         nsView.image = model.latestFrame
+        // .scaleNone draws one image pixel per point, that's what "100%" means
+        // here. Fit and the 5× punch-in both scale to the pane instead.
+        nsView.imageScaling = model.previewZoom == .actual
+            ? .scaleNone
+            : .scaleProportionallyUpOrDown
     }
 
     final class ImagePane: NSImageView {
         override var acceptsFirstResponder: Bool { true }
+
+        /// NSImageView reports the image's pixel size as its intrinsic size,
+        /// which SwiftUI honours, so a rotated (tall) frame or a frame larger
+        /// than the pane grew the VStack past the window and pushed the toolbar
+        /// and status footer off-screen. The enclosing SwiftUI `aspectRatio`
+        /// already decides how big this view should be, so opt out entirely.
+        override var intrinsicContentSize: NSSize {
+            NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+        }
     }
 }
-
-

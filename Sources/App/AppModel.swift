@@ -4,6 +4,7 @@ import AppKit
 import os
 import Camera
 import Hotkey
+import Scan
 
 private let appLog = Logger(subsystem: "co.wonders.filmtether", category: "AppModel")
 private let hotkeyLog = Logger(subsystem: "co.wonders.filmtether", category: "Hotkey")
@@ -18,8 +19,7 @@ enum AppInfo {
 
     /// Where the in-app "supported cameras" links point. The app UI stays
     /// camera-agnostic ("compatible camera"); the authoritative tested/supported
-    /// list lives in the public repo. TODO(publish): set to the real public
-    /// repo URL once the GitHub release repo is created.
+    /// list lives in the repo README.
     static let supportedCamerasURL = URL(string: "https://github.com/chriscantey/film-tether#supported-cameras")!
 }
 
@@ -130,6 +130,186 @@ final class AppModel: ObservableObject {
             AppSettings.shared.focusPeakingMode = newValue
             objectWillChange.send()
         }
+    }
+
+    /// Quarter-turn rotation of the live preview, proxied to AppSettings so it
+    /// survives relaunches. Display-only: the camera is never told about it and
+    /// captured files keep the body's native orientation. See `PreviewRotation`
+    /// for why every other coordinate in this class stays in sensor space.
+    var previewRotation: PreviewRotation {
+        get { AppSettings.shared.previewRotation }
+        set {
+            AppSettings.shared.previewRotation = newValue
+            objectWillChange.send()
+        }
+    }
+
+    /// Aspect ratio the preview pane should letterbox to. The body streams 3:2
+    /// at every zoom level, so only rotation can change this.
+    var previewAspectRatio: CGFloat {
+        previewRotation.displayAspect(sensorAspect: 3.0 / 2.0)
+    }
+
+    /// How the preview is scaled on screen. Session state, not persisted,
+    /// Fit is the right thing to land on every time you sit down.
+    @Published private(set) var previewZoom: PreviewZoom = .fit
+    /// Size of the preview pane in points, reported by the view layer. Feeds the
+    /// live "Fit (N%)" readout, so it has to come from real laid-out geometry
+    /// rather than an assumption about window size.
+    @Published var previewPaneSize: CGSize = .zero
+    /// Base zoom to restore when a momentary Shift-hold punch-in ends. Without
+    /// this, releasing Shift always dropped to Fit even if you were at 100%.
+    private var zoomBeforeHold: PreviewZoom = .fit
+
+    // MARK: - Preview adjustments (monochrome + click white balance)
+
+    /// Host-side preview corrections, proxied to AppSettings so they persist.
+    /// Display-only: the camera keeps its own settings and captured files are
+    /// never re-encoded. Recorded per scan so the same treatment can be
+    /// replayed onto the RAW later.
+    var previewAdjustments: PreviewAdjustments {
+        get { AppSettings.shared.previewAdjustments }
+        set {
+            AppSettings.shared.previewAdjustments = newValue
+            objectWillChange.send()
+        }
+    }
+
+    /// True while the eyedropper is armed and the next click on the preview
+    /// will sample white balance instead of moving the metering box.
+    @Published private(set) var isPickingWhiteBalance: Bool = false
+
+    /// Short-lived status line for the footer, used to explain a refused
+    /// eyedropper sample, which otherwise just looks like a click that did
+    /// nothing.
+    @Published private(set) var notice: String? = nil
+    private var noticeTask: Task<Void, Never>?
+
+    /// Most recent frame as it came off the camera, before any adjustment.
+    /// The eyedropper samples this rather than what's on screen: sampling the
+    /// corrected preview would compound corrections, so clicking the same spot
+    /// twice would drift instead of being a no-op.
+    private var lastUnadjustedFrame: Data?
+
+    func toggleMonochrome() {
+        previewAdjustments.monochrome.toggle()
+        appLog.info("preview monochrome → \(self.previewAdjustments.monochrome, privacy: .public)")
+    }
+
+    /// Flip the preview between the raw negative and the positive it will
+    /// become. Display only, the captured RAW is still the negative.
+    func toggleInvert() {
+        previewAdjustments.invert.toggle()
+        appLog.info("preview invert → \(self.previewAdjustments.invert, privacy: .public)")
+        // White-balance picking is blocked while inverted (see
+        // `canPickWhiteBalance`). Disarm on the way in, or the button would grey
+        // out while the pane still sampled on the next click.
+        if previewAdjustments.invert, isPickingWhiteBalance {
+            isPickingWhiteBalance = false
+            showNotice("White balance picking cancelled — switch to Negative to sample")
+        }
+    }
+
+    /// White balance can only be sampled from the un-inverted negative.
+    ///
+    /// Sampling actually works fine while inverted, the eyedropper reads the
+    /// original frame either way, but with the preview flipped, the film base
+    /// is the *darkest* part of the picture rather than the brightest, so the
+    /// operator is being asked to click the opposite of what they've learned to
+    /// look for. Blocking it is a deliberate guard against picking the wrong
+    /// spot, not a technical limitation.
+    var canPickWhiteBalance: Bool {
+        isLiveViewOn && !previewAdjustments.invert
+    }
+
+    /// Arm or disarm the white-balance eyedropper.
+    func toggleWhiteBalancePicker() {
+        isPickingWhiteBalance.toggle()
+        if isPickingWhiteBalance {
+            showNotice("Click the film base to set white balance")
+        }
+    }
+
+    func resetWhiteBalance() {
+        previewAdjustments.whiteBalance = nil
+        previewAdjustments.baseSample = nil
+        isPickingWhiteBalance = false
+        showNotice("White balance reset to as-shot")
+        appLog.info("white balance reset")
+    }
+
+    /// Sample the frame at `point` (normalized, y-down, unrotated sensor space)
+    /// and set the white balance that renders it neutral.
+    func sampleWhiteBalance(atSensor point: CGPoint) {
+        isPickingWhiteBalance = false
+        guard let jpeg = lastUnadjustedFrame else {
+            showNotice("No frame to sample — start live view first")
+            return
+        }
+        guard let s = PreviewPipeline.sampleColor(jpeg: jpeg, atNormalized: point) else {
+            showNotice("Couldn't read that pixel")
+            return
+        }
+        guard let gains = ChannelGains.neutralizing(red: s.red, green: s.green, blue: s.blue) else {
+            // Refusing beats applying a wild correction from a near-black
+            // sample, but the user needs to know why nothing happened.
+            showNotice("That spot is too dark to balance from — pick a brighter one")
+            return
+        }
+        previewAdjustments.whiteBalance = gains
+        // Keep the raw measurement: gains are clamped (lossy) and Film
+        // Positive wants the measured base itself for its spectral cross-check.
+        previewAdjustments.baseSample = BaseSample(red: s.red, green: s.green, blue: s.blue)
+        appLog.info("white balance set: r=\(gains.red, privacy: .public) g=\(gains.green, privacy: .public) b=\(gains.blue, privacy: .public)")
+        showNotice(String(format: "White balance set (R %.2f  G %.2f  B %.2f)",
+                          gains.red, gains.green, gains.blue))
+    }
+
+    private func showNotice(_ text: String) {
+        notice = text
+        noticeTask?.cancel()
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.notice = nil
+        }
+    }
+
+    /// Percentage at which the current frame fits the pane, or nil when there's
+    /// nothing to measure (live view off, or pane not laid out yet).
+    var previewFitPercent: Int? {
+        guard let frame = latestFrame else { return nil }
+        return PreviewZoom.fitPercent(frame: frame.size, pane: previewPaneSize)
+    }
+
+    /// Label for the zoom button, e.g. "Fit (85%)", "100%", "500%".
+    var previewZoomLabel: String { previewZoom.label(fitPercent: previewFitPercent) }
+
+    /// Advance the zoom button: Fit → 100% → 500% → Fit.
+    func cyclePreviewZoom() async {
+        await setPreviewZoom(previewZoom.next)
+    }
+
+    /// Set the display zoom and bring the camera's punch-in in line with it.
+    /// Only 500% needs the body involved; Fit and 100% are host-side scaling of
+    /// the same full-frame stream, so switching between those two costs no USB
+    /// traffic at all.
+    func setPreviewZoom(_ z: PreviewZoom) async {
+        let wasPunchedIn = previewZoom.engagesCameraPunchIn
+        self.previewZoom = z
+        appLog.info("preview zoom → \(z.rawValue, privacy: .public)")
+        guard z.engagesCameraPunchIn != wasPunchedIn else { return }
+        await applyZoom(z.engagesCameraPunchIn ? .fivex : .fit)
+    }
+
+    func rotatePreviewRight() {
+        previewRotation = previewRotation.rotatedRight
+        appLog.info("preview rotation → \(self.previewRotation.rawValue, privacy: .public)°")
+    }
+
+    func rotatePreviewLeft() {
+        previewRotation = previewRotation.rotatedLeft
+        appLog.info("preview rotation → \(self.previewRotation.rawValue, privacy: .public)°")
     }
 
     /// Cycle to the next peaking color. Wraps around after the last.
@@ -438,6 +618,11 @@ final class AppModel: ObservableObject {
         }
         if case .streaming = ui { self.ui = .ready; appLog.info("stopLiveView: ui → .ready") }
         latestFrame = nil
+        // Nothing left to sample, so an armed eyedropper would just fail on the
+        // next click. The white balance itself is kept, it belongs to the film,
+        // not to the live-view session.
+        lastUnadjustedFrame = nil
+        isPickingWhiteBalance = false
         // Reset zoom state so the next LV session starts at fit + center,
         // not whatever the last session left it at. Without this, the body's
         // zoom position persists across LV restarts (because we never
@@ -445,6 +630,8 @@ final class AppModel: ObservableObject {
         // hold zooms to the prior position instead of the current overlay
         // location.
         zoomMode = .fit
+        previewZoom = .fit
+        zoomBeforeHold = .fit
         zoomBodyCenter = (2592, 1728)  // Evf-space center; recomputed on next zoom anyway
     }
 
@@ -455,6 +642,13 @@ final class AppModel: ObservableObject {
         // overwrite latestFrame back to the old image. Dropping post-stop
         // frames keeps the preview pane truly empty when live view is off.
         guard ui == .streaming else { return }
+        // Live histogram: ~5 Hz is plenty for an exposure aid; skip while
+        // zoomed (the card hides then anyway) and while disabled. Computed
+        // inside the PreviewPipeline pass below so histogram ticks share the
+        // display render's single decode instead of decoding the JPEG twice.
+        histFrameTick &+= 1
+        let wantHistogram = AppSettings.shared.histogramEnabled
+            && zoomMode == .fit && histFrameTick % 6 == 0
         let now = Date()
         if let last = fpsLastFrameAt {
             let dt = now.timeIntervalSince(last)
@@ -485,28 +679,41 @@ final class AppModel: ObservableObject {
            let cropped = JPEGCrop.cropAt(jpeg, divisor: zoomMode.rawValue, center: meteringCenter) {
             jpeg = cropped
         }
-        if focusPeakingEnabled,
-           let peaked = FocusPeaking.apply(
-               toJPEG: jpeg,
-               mode: focusPeakingMode,
-               intensity: Float(AppSettings.shared.focusPeakingIntensity),
-               color: focusPeakingColor
-           ) {
-            jpeg = peaked
-        }
-        let base = NSImage(data: jpeg)
+        // Keep the frame exactly as the camera sent it for the eyedropper to
+        // sample; everything below is correction the sample must not see.
+        lastUnadjustedFrame = jpeg
+        let peaking = focusPeakingEnabled
+            ? PreviewPipeline.Peaking(
+                mode: focusPeakingMode,
+                intensity: Float(AppSettings.shared.focusPeakingIntensity),
+                color: focusPeakingColor
+              )
+            : nil
+        // One decode, one Core Image graph, one bitmap out, plus the
+        // histogram tap on its ticks, sharing that same decode. Returns a nil
+        // image when there's nothing to apply, which is the common case, then
+        // the JPEG goes straight to NSImage and Core Image never runs.
+        let (rendered, hist) = PreviewPipeline.renderTapped(
+            jpeg: jpeg, adjustments: previewAdjustments, peaking: peaking,
+            computeHistogram: wantHistogram
+        )
+        if let hist { histogramData = hist }
+        let base = rendered ?? NSImage(data: jpeg)
         // Draw the zoom box DIRECTLY INTO the frame (image-pixel space), not as
         // a separate SwiftUI overlay. This makes the box physically part of the
         // displayed image, so it can never drift from the image content the way
         // a floating overlay with its own geometry could, and since the zoom
         // maps from this same image space, the box and the zoomed region are
         // the same thing by construction. Drawn only at fit + while hovering.
+        var composed = base
         if let base, showMeteringOverlay, zoomMode == .fit {
-            self.latestFrame = Self.drawZoomBox(on: base, center: meteringCenter,
-                                                fraction: AppModel.zoomBoxFraction)
-        } else {
-            self.latestFrame = base
+            composed = Self.drawZoomBox(on: base, center: meteringCenter,
+                                        fraction: AppModel.zoomBoxFraction)
         }
+        // Rotation is deliberately the LAST step: every overlay above was
+        // positioned in sensor space, so turning the finished frame keeps the
+        // box glued to the image content instead of sliding off it.
+        self.latestFrame = composed.map { previewRotation.rotate($0) }
     }
 
     /// Composite the zoom-target rectangle onto a copy of the frame in image
@@ -551,6 +758,33 @@ final class AppModel: ObservableObject {
         let pattern = AppSettings.shared.filenamePattern
         appLog.info("captureNow → \(folder.path, privacy: .public)/\(pattern, privacy: .public)")
 
+        // Snapshot the camera/film provenance and fold the live values into
+        // history (so a value typed-but-not-Return'd still gets remembered the
+        // moment it's used on a capture).
+        let metaOn = AppSettings.shared.metadataEnabled
+        if metaOn {
+            AppSettings.shared.commitCamera(AppSettings.shared.shotCamera)
+            AppSettings.shared.commitFilm(AppSettings.shared.shotFilm)
+        }
+        // Meta OFF → empty metadata → MetadataWriter.write is a no-op:
+        // no sidecar, no embed, field values untouched for later. The active
+        // preview treatment rides along under the same gate, recorded per
+        // capture only when Meta is ON and only when it carries data.
+        let adj = previewAdjustments
+        let treatment = TreatmentRecord(
+            baseSample: adj.baseSample.map { .init(r: $0.red, g: $0.green, b: $0.blue) },
+            previewGains: adj.whiteBalance.flatMap {
+                $0.isIdentity ? nil : .init(r: $0.red, g: $0.green, b: $0.blue)
+            },
+            inverted: adj.invert,
+            monochrome: adj.monochrome
+        )
+        let metadata = metaOn
+            ? CaptureMetadata(camera: AppSettings.shared.shotCamera,
+                              film: AppSettings.shared.shotFilm,
+                              treatment: treatment.isEmpty ? nil : treatment)
+            : CaptureMetadata(camera: "", film: "")
+
         // The old gp_camera_capture path hung against EVF and so required a
         // pause/teardown/restart dance. The new eosremoterelease=Immediate
         // path inside CameraCapture honors the body's current LV+meter state
@@ -577,7 +811,7 @@ final class AppModel: ObservableObject {
         var captureError: Error?
         await withLVPriority {
             do {
-                captureResult = try await cap.capture(to: folder, filenamePattern: pattern)
+                captureResult = try await cap.capture(to: folder, filenamePattern: pattern, metadata: metadata)
             } catch {
                 captureError = error
             }
@@ -585,7 +819,7 @@ final class AppModel: ObservableObject {
 
         if let result = captureResult {
             self.lastCapture = result.path.lastPathComponent
-            self.capturedFiles.append(result.path)
+            self.capturedFiles.append(contentsOf: result.allPaths)
             self.snapshot.iso = result.iso ?? self.snapshot.iso
             self.snapshot.shutter = result.shutter ?? self.snapshot.shutter
             self.snapshot.aperture = result.aperture ?? self.snapshot.aperture
@@ -717,6 +951,19 @@ final class AppModel: ObservableObject {
                 var s = self.snapshot
                 s.aperture = value
                 self.snapshot = s
+            case "autoexposuremode":
+                // Mode-dial turn. This is the ONLY prompt reflection of the
+                // dial during LV streaming (the snapshot poller deliberately
+                // idles then), so update the snapshot's mode immediately,
+                // that alone unlocks/locks the exposure pickers, and refresh
+                // choices after the dial settles.
+                var s = self.snapshot
+                guard s.mode != value else { break }
+                appLog.notice("mode dial: \(s.mode, privacy: .public) → \(value, privacy: .public) (event), scheduling choices reload")
+                s.mode = value
+                self.snapshot = s
+                self.snapshotTick &+= 1
+                scheduleModeChangeRefresh()
             // focusmode events are useful but PropertySnapshot doesn't surface
             // focusMode in the UI today, capture path just writes Manual/
             // One Shot directly. Skip rather than carry dead state.
@@ -730,6 +977,25 @@ final class AppModel: ObservableObject {
             break
         }
     }
+
+    /// A mode-dial sweep emits one autoexposuremode event per detent it
+    /// passes through. Debounce so snapshot + choices reload once, after the
+    /// dial settles, instead of once per intermediate position.
+    private var modeChangeRefreshTask: Task<Void, Never>?
+    private func scheduleModeChangeRefresh() {
+        modeChangeRefreshTask?.cancel()
+        modeChangeRefreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard let self, !Task.isCancelled else { return }
+            await self.refreshSnapshot()
+            await self.loadChoices()
+        }
+    }
+
+    /// Latest live-histogram sample (nil until first compute). Written inline
+    /// from handleFrame's PreviewPipeline tap, read by HistogramOverlay.
+    @Published var histogramData: HistogramData?
+    private var histFrameTick: Int = 0
 
     /// Drop-flag so rapid manual-focus button mashing doesn't queue dozens of
     /// USB writes. Mashing once fired ~40 writes in 11 seconds and
@@ -793,14 +1059,10 @@ final class AppModel: ObservableObject {
         await refreshSnapshot()
     }
 
-    /// Toggle 5× zoom mode latched (vs the momentary Space-hold). For the
-    /// toolbar zoom button: button = toggle, Space = hold.
+    /// Latched punch-in toggle, kept for any caller that wants a straight
+    /// in/out flip rather than the three-state cycle on the toolbar button.
     func toggleZoom() async {
-        if zoomMode == .fit {
-            await applyZoom(.fivex)
-        } else {
-            await applyZoom(.fit)
-        }
+        await setPreviewZoom(previewZoom.engagesCameraPunchIn ? .fit : .fiveX)
     }
 
     func setImageFormat(_ value: String) async {
@@ -985,6 +1247,7 @@ final class AppModel: ObservableObject {
     private func startSnapshotRefresh() {
         snapshotRefreshTask?.cancel()
         snapshotRefreshTask = Task { [weak self] in
+            var idleTick = 0
             while !Task.isCancelled {
                 guard let self else { return }
                 let isStreaming = await MainActor.run { self.ui == .streaming }
@@ -1007,9 +1270,16 @@ final class AppModel: ObservableObject {
                     return false
                 }
                 guard stillConnected else { continue }
+                let modeBefore = await MainActor.run { self.snapshot.mode }
                 await self.refreshSnapshot()
-                // Reload choices every 4th tick, they change less often than values.
-                if Int.random(in: 0..<4) == 0 {
+                let modeAfter = await MainActor.run { self.snapshot.mode }
+                idleTick &+= 1
+                // Choices change rarely EXCEPT on a mode change, where they
+                // change almost certainly (Av's shutter list is "auto"; M's is
+                // the real ladder). Mode change → reload now; otherwise every
+                // 3rd tick. Deterministic, the old Int.random(0..<4) gate
+                // could starve reloads for minutes on a bad streak.
+                if modeAfter != modeBefore || idleTick % 3 == 0 {
                     await self.loadChoices()
                 }
             }
@@ -1096,9 +1366,12 @@ final class AppModel: ObservableObject {
         case .pressed:
             // Trigger held (Shift by default) → punch in to 5× sensor zoom.
             // 10× was removed (silently no-ops on this 7D firmware).
-            await applyZoom(.fivex)
+            // Remember where we were so the release restores it: holding Shift
+            // from 100% used to dump you back at Fit.
+            if !previewZoom.engagesCameraPunchIn { zoomBeforeHold = previewZoom }
+            await setPreviewZoom(.fiveX)
         case .released:
-            await applyZoom(.fit)
+            await setPreviewZoom(zoomBeforeHold)
         case .arrow(let direction):
             // Arrow nudge moves the zoom rect by ONE FULL RECT STEP per
             // press (matches EOS Utility behavior). Now that zoom is
@@ -1115,13 +1388,20 @@ final class AppModel: ObservableObject {
         let f = AppModel.zoomBoxFraction
         let step = f                 // one box-width per press
         let lo = f / 2, hi = 1 - f / 2   // keep the box fully inside the frame
-        var c = meteringCenter
+        // The arrow the user pressed is a direction on SCREEN; meteringCenter
+        // lives in sensor space. Map through the rotation so pressing Up always
+        // moves the box up in the preview, whichever way the frame is turned.
+        let screenDelta: CGVector
         switch direction {
-        case .up:    c.y = max(lo, c.y - step)
-        case .down:  c.y = min(hi, c.y + step)
-        case .left:  c.x = max(lo, c.x - step)
-        case .right: c.x = min(hi, c.x + step)
+        case .up:    screenDelta = CGVector(dx: 0, dy: -step)
+        case .down:  screenDelta = CGVector(dx: 0, dy: step)
+        case .left:  screenDelta = CGVector(dx: -step, dy: 0)
+        case .right: screenDelta = CGVector(dx: step, dy: 0)
         }
+        let d = previewRotation.sensorDelta(fromDisplay: screenDelta)
+        var c = meteringCenter
+        c.x = min(max(c.x + d.dx, lo), hi)
+        c.y = min(max(c.y + d.dy, lo), hi)
         meteringCenter = c
         // If the real sensor zoom is engaged, move the punch-in to the new
         // spot too (arrows nudge the live magnified region, like EOS Utility).

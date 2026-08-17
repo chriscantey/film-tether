@@ -58,12 +58,41 @@ struct StatusFooter: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            if model.zoomMode != .fit {
-                Text("Zoom: \(model.zoomMode.rawValue)x\(model.zoomFallbackActive ? " (sw)" : "")")
+            // Only worth footer space when the preview isn't showing the plain
+            // fitted frame; "(sw)" flags that the body refused the punch-in and
+            // we're upscaling a crop host-side instead of showing real detail.
+            if model.isLiveViewOn, model.previewZoom != .fit {
+                Text("Zoom: \(model.previewZoomLabel)\(model.zoomFallbackActive ? " (sw)" : "")")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+            if model.previewAdjustments.invert {
+                Text("Positive")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("Preview is inverted to show the positive image. The captured RAW is still the negative.")
+            }
+            if model.previewAdjustments.monochrome {
+                Text("B&W")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("Preview is being shown in black and white. Saved files are unaffected.")
+            }
+            if let wb = model.previewAdjustments.whiteBalance {
+                Text(String(format: "WB %.2f/%.2f/%.2f", wb.red, wb.green, wb.blue))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .help("Host-side white-balance gains (R/G/B) sampled from the preview. Saved files are unaffected.")
+            }
             Spacer()
+            // Transient feedback for the eyedropper, a refused sample would
+            // otherwise look like a click that simply did nothing.
+            if let notice = model.notice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
             if let last = model.lastCapture {
                 Text("Last: \(last)")
                     .font(.caption.monospacedDigit())

@@ -203,7 +203,16 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Button("Choose…") { chooseCaptureFolder() }
                 }
-                Text("Captured RAW files (.CR2) land here. The app writes whatever bytes the camera produces, no re-encoding. Set the camera-side image quality to RAW (or RAW+JPEG) and you get the full sensor data.")
+                Text("Captured files land here exactly as the camera produced them, no re-encoding, with the camera's real extension (.CR2, .CR3, .JPG…). Set the camera-side image quality to RAW and you get the full sensor data; RAW+JPEG saves both files.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Metadata") {
+                Toggle("Write metadata into the RAW file", isOn: $settings.embedMetadata)
+                Text(settings.embedMetadata
+                     ? "Camera/Film metadata is embedded inside the .CR2 itself (sensor data is never touched, and the write is verified before it replaces the file). Travels with the file forever, read by FilmLab and everything else."
+                     : "Camera/Film metadata is written to a .xmp sidecar next to the .CR2. The RAW file is never opened. Read by Lightroom, Capture One, darktable, and Film Positive.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -211,7 +220,7 @@ struct SettingsView: View {
             Section("Filename pattern") {
                 TextField("", text: $settings.filenamePattern)
                     .font(.system(.body, design: .monospaced))
-                Text("Tokens: {ymd} = yyyyMMdd, {hms} = HHmmss, {seq} = zero-padded session counter.")
+                Text("Tokens: {ymd} = yyyyMMdd, {hms} = HHmmss, {seq} = zero-padded session counter, {ext} = the camera file's own extension (CR2, CR3, JPG…). A literal extension in the pattern is corrected to the real one at save time.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Preview: \(previewFilename())")

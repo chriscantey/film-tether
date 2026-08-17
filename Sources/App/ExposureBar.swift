@@ -1,10 +1,43 @@
 import SwiftUI
 import Camera
+import Scan
 
 struct ExposureBar: View {
     @EnvironmentObject var model: AppModel
+    @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
+        // Three equal flexible regions, focus | capture | settings, each
+        // cluster centered within its own region, dividers at the region
+        // boundaries. Equal regions put the boundaries (and Capture) at
+        // symmetric positions by construction, no gap arithmetic.
+        HStack(spacing: 8) {
+            // The two SIDE regions share one minWidth (sized to the wider
+            // cluster, the settings strip) so they stay EQUAL at every window
+            // width, which keeps Capture at true window center and the two
+            // dividers symmetric even when the window is at its minimum.
+            // Letting the regions compress independently visibly drifted the
+            // capture button off center as the window narrowed.
+            region(minWidth: 480) { focusGroup().fixedSize() }
+            Divider().frame(height: 28)
+            region(minWidth: 132) { captureButton() }
+            Divider().frame(height: 28)
+            region(minWidth: 480) { settingsCluster() }
+        }
+    }
+
+    /// One region with its content centered. Regions given the same minWidth
+    /// flex identically, so their boundaries stay symmetric.
+    private func region<Content: View>(minWidth: CGFloat, @ViewBuilder _ content: () -> Content) -> some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            content()
+            Spacer(minLength: 0)
+        }
+        .frame(minWidth: minWidth, maxWidth: .infinity)
+    }
+
+    private func settingsCluster() -> some View {
         HStack(spacing: 10) {
             menuPicker(
                 label: "ISO",
@@ -27,60 +60,24 @@ struct ExposureBar: View {
             )
             kelvinStepper()
             imageFormatPicker()
-            Divider().frame(height: 28)
-            focusGroup()
-            Divider().frame(height: 28)
-            captureButton()
-            liveViewToggle()
-            peakingToggleButton()
-            boxToggleButton()
-            zoomToggleButton()
         }
+        .fixedSize()
     }
 
-    @ViewBuilder
-    private func boxToggleButton() -> some View {
+    private func captureButton() -> some View {
         Button {
-            model.showMeteringOverlay.toggle()
+            Task { await model.captureNow() }
         } label: {
-            Label(
-                model.showMeteringOverlay ? "Box ON" : "Box OFF",
-                systemImage: model.showMeteringOverlay ? "plus.viewfinder" : "viewfinder"
-            )
-            .labelStyle(.titleAndIcon)
+            Label("Capture", systemImage: "camera.shutter.button")
+                .labelStyle(.titleAndIcon)
+                .padding(.horizontal, 4)
         }
-        .help("Show/hide the zoom-target crosshair box (default on). Click anywhere on live view to move it.")
-        .disabled(!model.isLiveViewOn)
-    }
-
-    @ViewBuilder
-    private func peakingToggleButton() -> some View {
-        Button {
-            model.focusPeakingEnabled.toggle()
-        } label: {
-            Label(
-                model.focusPeakingEnabled ? "Peaking ON" : "Peaking OFF",
-                systemImage: model.focusPeakingEnabled ? "scope" : "circle.dotted"
-            )
-            .labelStyle(.titleAndIcon)
-        }
-        .help("Toggle focus peaking overlay (Cmd-P). Cmd-Shift-P cycles color.")
-        .disabled(!model.isLiveViewOn)
-    }
-
-    @ViewBuilder
-    private func zoomToggleButton() -> some View {
-        let isZoomed = model.zoomMode != .fit
-        Button {
-            Task { await model.toggleZoom() }
-        } label: {
-            Label(
-                isZoomed ? "Zoom 5×" : "Zoom 1×",
-                systemImage: isZoomed ? "magnifyingglass.circle.fill" : "magnifyingglass.circle"
-            )
-            .labelStyle(.titleAndIcon)
-        }
-        .help("Toggle latched 5× sensor zoom. Hold Shift for momentary zoom while held. Drag the overlay rectangle to choose punch-in location BEFORE zooming.")
+        .keyboardShortcut(.return, modifiers: [.command, .shift])
+        .buttonStyle(.borderedProminent)
+        .controlSize(.regular)
+        .help(model.isLiveViewOn
+              ? "Capture and download a RAW (Cmd-Shift-Return or just Space)"
+              : "Start live view first, capture requires LV up so exposure matches preview")
         .disabled(!model.isLiveViewOn)
     }
 
@@ -265,46 +262,12 @@ struct ExposureBar: View {
                 .frame(width: 24)   // was 32; 6 buttons × 8px saved = 48px room recovered
         }
         .controlSize(.small)
+        // Hold-to-repeat: keep a fine button pressed and it fires repeatedly,
+        // instead of mashing. Pacing stays safe, driveManualFocus's in-flight
+        // drop-flag caps the USB write rate no matter how fast repeats arrive.
+        .buttonRepeatBehavior(.enabled)
         .help(help)
         .disabled(!model.isLiveViewOn)
-    }
-
-    @ViewBuilder
-    private func captureButton() -> some View {
-        Button {
-            Task { await model.captureNow() }
-        } label: {
-            Label("Capture", systemImage: "camera.shutter.button")
-                .labelStyle(.titleAndIcon)
-        }
-        .keyboardShortcut(.return, modifiers: [.command, .shift])
-        .buttonStyle(.borderedProminent)
-        // No explicit .tint(), let SwiftUI pick up the OS accent color
-        // (System Settings → Appearance → Accent). Adapts to user
-        // preference automatically; respects light/dark mode.
-        .controlSize(.regular)   // was .large, shrunk to fit the toolbar
-        .help(model.isLiveViewOn
-              ? "Capture and download a RAW (Cmd-Shift-Return or just Return)"
-              : "Start live view first, capture requires LV up so exposure matches preview")
-        .disabled(!model.isLiveViewOn)
-    }
-
-    @ViewBuilder
-    private func liveViewToggle() -> some View {
-        Button {
-            Task {
-                if model.isLiveViewOn {
-                    await model.stopLiveView()
-                } else {
-                    await model.startLiveView()
-                }
-            }
-        } label: {
-            Text(model.isLiveViewOn ? "Stop Live View" : "Start Live View")
-                .frame(width: 104)
-        }
-        .keyboardShortcut("l", modifiers: [.command])
-        .help("Toggle live preview (Cmd-L)")
     }
 
     private func writableForCurrentMode(_ prop: String) -> Bool {

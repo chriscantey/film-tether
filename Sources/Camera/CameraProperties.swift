@@ -246,8 +246,56 @@ public final class CameraProperties {
         return Int(s) ?? 0
     }
 
+    /// The white-balance mode in which `colortemperature` is the value the body
+    /// actually uses. Any other mode ignores it.
+    ///
+    /// `nonisolated` so the UI can compare against it without hopping to the
+    /// camera actor, it's a constant string, not camera state.
+    public nonisolated static let colorTemperatureMode = "Color Temperature"
+
+    /// Set the body's colour temperature, **putting it into Color Temperature
+    /// mode first** so the value is the one actually applied.
+    ///
+    /// Writing `colortemperature` on its own is close to useless and actively
+    /// harmful: the body keeps whatever white-balance mode it was in and quietly
+    /// derives its own temperature, so the number the app shows bears no
+    /// relation to the exposure. Alex measured it on the R5, a capture whose
+    /// EXIF recorded `Color Temperature: 5200` while `Color Temp As Shot` was
+    /// 2639, mode left on `Custom Whitebalance: PC-1`. Roughly a 2600K error
+    /// against a daylight light table, with no way to see or correct it from
+    /// the app.
+    ///
+    /// Best-effort on the mode: bodies that don't expose the choice still get
+    /// the temperature written, which is no worse than before.
     public func setWhiteBalanceKelvin(_ k: Int) async throws {
+        try? await ensureColorTemperatureMode()
         try await setString("colortemperature", value: "\(k)")
+    }
+
+    /// Switch to Color Temperature white balance if the body offers it and
+    /// isn't already there. Skipped silently when the choice doesn't exist.
+    ///
+    /// The cheap read comes first, deliberately. Upstream fetches the choice
+    /// list before comparing, but our `choices(for:)` is uncached, it does a
+    /// full `gp_camera_get_config` + `resolveLeaf` every call, and this now
+    /// runs on every Kelvin write, which the UI drives from a Stepper. Holding
+    /// a stepper key would otherwise mean one full config read per repeat, over
+    /// USB2, with live view up. After the first write the mode already matches
+    /// and this returns on one `getString`.
+    private func ensureColorTemperatureMode() async throws {
+        let current = try? await getString("whitebalance")
+        if let current,
+           current.caseInsensitiveCompare(Self.colorTemperatureMode) == .orderedSame {
+            return
+        }
+        let available = (try? await choices(for: "whitebalance")) ?? []
+        guard let target = available.first(where: {
+            $0.caseInsensitiveCompare(Self.colorTemperatureMode) == .orderedSame
+        }) else { return }
+        try await setString("whitebalance", value: target)
+        CameraLog.properties.info(
+            "whitebalance → \(target, privacy: .public) (was \(current ?? "?", privacy: .public)) so colortemperature applies"
+        )
     }
 
     /// Read the body's current metering mode. Values on the 7D:
@@ -474,6 +522,19 @@ public final class CameraProperties {
     /// The 7D does NOT expose a plain `datetime` widget (only `datetimeutc`),
     /// so the previous "write local-clock-as-pseudo-UTC" trick silently fell
     /// back to vanilla syncdatetimeutc, leaving the drift in place.
+    ///
+    /// **Verified on the R5 (2026-07-28).** That body exposes all four leaves,
+    /// `settings/datetime`, `settings/datetimeutc`, `actions/syncdatetime`,
+    /// `actions/syncdatetimeutc`, and this function works there unmodified:
+    /// a clock skewed by an hour was corrected to within a second, and EXIF
+    /// DateTimeOriginal on the resulting CR3 matched host wall clock with a
+    /// correct -07:00 / Los Angeles / DST-on zone. `tzOffsetMinutes` is NOT
+    /// needed on the R5; leave it at 0.
+    ///
+    /// One R5 trap worth knowing: `settings/datetime` advertises `Readonly: 0`
+    /// but **silently ignores writes**, no error, value simply unchanged.
+    /// `settings/datetimeutc` is the one that actually takes, which is what we
+    /// write below. Don't "simplify" this to write `datetime`.
     ///
     /// Workaround: pass `tzOffsetMinutes` matching the camera's TZ-menu
     /// delta from host. Camera on PST (-8), host on PDT (-7) → pass +60. The

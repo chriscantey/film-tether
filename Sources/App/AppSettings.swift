@@ -1,5 +1,7 @@
 import Foundation
 import SwiftUI
+import Camera
+import Scan
 
 /// Persisted app settings, backed by UserDefaults.
 ///
@@ -19,6 +21,10 @@ final class AppSettings: ObservableObject {
         static let captureKeyCode = "captureKeyCode"
         static let zoomKeyCode = "zoomKeyCode"
         static let zoomUsesShift = "zoomUsesShift"
+        static let embedMetadata = "embedMetadata"
+        static let metadataEnabled = "metadataEnabled"
+        static let histogramEnabled = "histogramEnabled"
+        static let histogramCorner = "histogramCorner"
         static let enableGlobalHotkey = "enableGlobalHotkey"
         static let hotkeyMappingVersion = "hotkeyMappingVersion"
         static let focusPeakingColor = "focusPeakingColor"
@@ -30,6 +36,14 @@ final class AppSettings: ObservableObject {
         static let showMeteringOverlay = "showMeteringOverlay"
         static let showBatteryIndicator = "showBatteryIndicator"
         static let showMeteredShutter = "showMeteredShutter"
+        static let shotCamera = "shotCamera"
+        static let shotFilm = "shotFilm"
+        static let cameraHistory = "cameraHistory"
+        static let filmHistory = "filmHistory"
+        static let previewRotation = "previewRotation"
+        static let previewMonochrome = "previewMonochrome"
+        static let previewInvert = "previewInvert"
+        static let previewWhiteBalance = "previewWhiteBalance"
     }
 
     // MARK: - Defaults
@@ -41,7 +55,12 @@ final class AppSettings: ObservableObject {
         return pics.appendingPathComponent("Film Tether")
     }
 
-    static let defaultFilenamePattern = "IMG_{ymd}_{hms}_{seq}.CR2"
+    /// `{ext}` resolves to the extension of the file the camera actually
+    /// produced (CR2 on a 7D, CR3 on an R5, JPG for JPEG quality). Patterns
+    /// with a hardcoded literal extension (older installs stored ".CR2") get
+    /// the extension corrected at save time too, the name never lies about
+    /// the bytes inside.
+    static let defaultFilenamePattern = "IMG_{ymd}_{hms}_{seq}.{ext}"
 
     /// Default capture key: Space (US keycode 0x31). (Was Return until remapped
     /// so the space bar triggers capture.)
@@ -132,6 +151,32 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(enableGlobalHotkey, forKey: Key.enableGlobalHotkey) }
     }
 
+    /// Master metadata switch (Meta ON/OFF button, main row). When off the
+    /// fields gray out and captures write nothing, no sidecar, no embed.
+    @Published var metadataEnabled: Bool {
+        didSet { defaults.set(metadataEnabled, forKey: Key.metadataEnabled) }
+    }
+
+    /// Live RGB histogram overlay (Hist toggle, row 2). Corner persists.
+    @Published var histogramEnabled: Bool {
+        didSet { defaults.set(histogramEnabled, forKey: Key.histogramEnabled) }
+    }
+    @Published var histogramCorner: HistogramCorner {
+        didSet { defaults.set(histogramCorner.rawValue, forKey: Key.histogramCorner) }
+    }
+
+    /// Metadata backend choice. OFF (default) = XMP sidecar next to the CR2,
+    /// the RAW is never opened. ON = splice the packet into the CR2 itself
+    /// (append-only, sensor bytes untouched, atomic swap; falls back to
+    /// sidecar on unrecognized containers). Mirrored into
+    /// `MetadataWriter.backend` so the capture path needs no settings import.
+    @Published var embedMetadata: Bool {
+        didSet {
+            defaults.set(embedMetadata, forKey: Key.embedMetadata)
+            MetadataWriter.backend = embedMetadata ? .embedded : .sidecar
+        }
+    }
+
     // MARK: - Focus peaking
 
     @Published var focusPeakingColor: FocusPeaking.PeakColor {
@@ -200,10 +245,136 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(showMeteredShutter, forKey: Key.showMeteredShutter) }
     }
 
+    // MARK: - Capture metadata (camera + film)
+
+    /// The original film camera the negative was shot on (e.g. "Leica M6").
+    /// Written into the captured CR2's EXIF Make/Model on capture. Persisted so
+    /// the last-used value is restored on the next launch. The Canon DSLR is
+    /// only the scanner here; this names the *real* camera for photo apps.
+    @Published var shotCamera: String {
+        didSet { defaults.set(shotCamera, forKey: Key.shotCamera) }
+    }
+
+    /// The film stock the negative was shot on (e.g. "Kodak Portra 400").
+    /// Written into AnalogExif XMP + a searchable keyword + the caption on
+    /// capture. Persisted so the last-used value is restored on launch.
+    @Published var shotFilm: String {
+        didSet { defaults.set(shotFilm, forKey: Key.shotFilm) }
+    }
+
+    /// Previously-used camera strings, most-recent-first. A plain list of
+    /// strings, no IDs, no records, that backs the field's dropdown. Entries
+    /// are individually removable. Capped at `maxHistory`.
+    @Published private(set) var cameraHistory: [String] {
+        didSet { defaults.set(cameraHistory, forKey: Key.cameraHistory) }
+    }
+
+    /// Previously-used film strings, most-recent-first. Same plain-list model
+    /// as `cameraHistory`.
+    @Published private(set) var filmHistory: [String] {
+        didSet { defaults.set(filmHistory, forKey: Key.filmHistory) }
+    }
+
+    /// Cap on stored history so the dropdown and UserDefaults never grow
+    /// unbounded. Old entries fall off the end; users can also remove any
+    /// entry by hand.
+    static let maxHistory = 50
+
+    /// Record `value` as the current camera and fold it into history
+    /// (case-insensitive dedup, moved to front). Trims whitespace. An empty
+    /// value clears the current selection without touching history.
+    func commitCamera(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        shotCamera = trimmed
+        guard !trimmed.isEmpty else { return }
+        cameraHistory = Self.fold(trimmed, into: cameraHistory)
+    }
+
+    /// Record `value` as the current film and fold it into history.
+    func commitFilm(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        shotFilm = trimmed
+        guard !trimmed.isEmpty else { return }
+        filmHistory = Self.fold(trimmed, into: filmHistory)
+    }
+
+    /// Remove a single entry from camera history (the little "x" in the
+    /// dropdown). Case-insensitive so the visible row always disappears.
+    func removeCameraHistory(_ value: String) {
+        cameraHistory.removeAll { $0.caseInsensitiveCompare(value) == .orderedSame }
+    }
+
+    /// Remove a single entry from film history.
+    func removeFilmHistory(_ value: String) {
+        filmHistory.removeAll { $0.caseInsensitiveCompare(value) == .orderedSame }
+    }
+
+    /// Case-insensitive dedup + move-to-front + cap. Pure helper so both
+    /// commit paths behave identically.
+    private static func fold(_ value: String, into list: [String]) -> [String] {
+        var out = list.filter { $0.caseInsensitiveCompare(value) != .orderedSame }
+        out.insert(value, at: 0)
+        if out.count > maxHistory { out = Array(out.prefix(maxHistory)) }
+        return out
+    }
+
+    // MARK: - Preview rotation
+
+    /// Quarter-turn rotation of the live preview. Persisted because a scanning
+    /// rig's camera-to-film orientation is fixed for a whole session (and
+    /// usually for good), so re-setting it on every launch would be busywork.
+    ///
+    /// Rotation is meant to persist from frame to frame until the negative
+    /// size changes. There is no negative-size concept in the app yet, so for
+    /// now it simply persists.
+    @Published var previewRotation: PreviewRotation {
+        didSet { defaults.set(previewRotation.rawValue, forKey: Key.previewRotation) }
+    }
+
+    // MARK: - Preview adjustments (monochrome + white balance)
+
+    /// Host-side preview corrections. Persisted because both are properties of
+    /// the film you're working through, not of the app session, a roll of
+    /// black-and-white stock stays black-and-white across a lunch break, and
+    /// the film base you sampled is the same base after a relaunch.
+    ///
+    /// Stored as two defaults keys rather than one encoded blob so the values
+    /// stay legible in `defaults read` when diagnosing a scanning session.
+    @Published var previewAdjustments: PreviewAdjustments {
+        didSet {
+            defaults.set(previewAdjustments.monochrome, forKey: Key.previewMonochrome)
+            defaults.set(previewAdjustments.invert, forKey: Key.previewInvert)
+            if let wb = previewAdjustments.whiteBalance,
+               let data = try? JSONEncoder().encode(wb) {
+                defaults.set(data, forKey: Key.previewWhiteBalance)
+            } else {
+                defaults.removeObject(forKey: Key.previewWhiteBalance)
+            }
+        }
+    }
+
     // MARK: - Init
 
     private init() {
-        self.filenamePattern = defaults.string(forKey: Key.filenamePattern) ?? Self.defaultFilenamePattern
+        self.histogramEnabled = defaults.bool(forKey: Key.histogramEnabled)
+        self.histogramCorner = HistogramCorner(rawValue: defaults.string(forKey: Key.histogramCorner) ?? "") ?? .topRight
+        self.metadataEnabled = defaults.object(forKey: Key.metadataEnabled) as? Bool ?? true
+        self.embedMetadata = defaults.bool(forKey: Key.embedMetadata)
+        MetadataWriter.backend = defaults.bool(forKey: Key.embedMetadata) ? .embedded : .sidecar
+        self.shotCamera = defaults.string(forKey: Key.shotCamera) ?? ""
+        self.shotFilm = defaults.string(forKey: Key.shotFilm) ?? ""
+        self.cameraHistory = defaults.stringArray(forKey: Key.cameraHistory) ?? []
+        self.filmHistory = defaults.stringArray(forKey: Key.filmHistory) ?? []
+        var storedPattern = defaults.string(forKey: Key.filenamePattern) ?? Self.defaultFilenamePattern
+        // One-time migration: installs that saved the pre-{ext} default keep
+        // its hardcoded ".CR2" in UserDefaults. Save-time extension correction
+        // makes it harmless, but move them to the new default so the Settings
+        // preview reflects reality. Custom patterns are left untouched.
+        if storedPattern == "IMG_{ymd}_{hms}_{seq}.CR2" {
+            storedPattern = Self.defaultFilenamePattern
+            defaults.set(storedPattern, forKey: Key.filenamePattern)
+        }
+        self.filenamePattern = storedPattern
         // One-time hotkey-mapping migration. Existing installs have a stored
         // captureKeyCode (Return) and no zoomUsesShift, so just changing the
         // static defaults wouldn't move them. Bumping the version forces the
@@ -261,6 +432,15 @@ final class AppSettings: ObservableObject {
         self.showBatteryIndicator = defaults.bool(forKey: Key.showBatteryIndicator)
         // Default OFF, value is sporadic on this body; opt-in.
         self.showMeteredShutter = defaults.bool(forKey: Key.showMeteredShutter)
+        // Missing key reads as 0, which is exactly `.none`, the right default.
+        self.previewRotation = PreviewRotation(rawValue: defaults.integer(forKey: Key.previewRotation)) ?? .none
+        let storedWB = defaults.data(forKey: Key.previewWhiteBalance)
+            .flatMap { try? JSONDecoder().decode(ChannelGains.self, from: $0) }
+        self.previewAdjustments = PreviewAdjustments(
+            monochrome: defaults.bool(forKey: Key.previewMonochrome),
+            invert: defaults.bool(forKey: Key.previewInvert),
+            whiteBalance: storedWB
+        )
         loadCaptureFolder()
     }
 }

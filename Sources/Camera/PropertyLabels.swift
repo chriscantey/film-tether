@@ -168,6 +168,17 @@ public enum PropertyLabels {
         case "batterylevel":  formatter = battery
         default:              formatter = { $0 }
         }
-        return choices.map { (raw: $0, label: formatter($0)) }
+        // Bodies occasionally repeat entries, and two distinct raw values can
+        // format to the same display label, either way the menu shows
+        // duplicates the user can't distinguish. Keep the first occurrence,
+        // preserve order.
+        var seenRaw = Set<String>()
+        var seenLabel = Set<String>()
+        return choices.compactMap { raw in
+            guard seenRaw.insert(raw).inserted else { return nil }
+            let label = formatter(raw)
+            guard seenLabel.insert(label).inserted else { return nil }
+            return (raw: raw, label: label)
+        }
     }
 }

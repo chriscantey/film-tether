@@ -11,19 +11,30 @@ Open source, MIT, macOS 14+.
 The handful of things that actually matter for the way I use it.
 
 - **Live preview.** Standard tethered live preview, straight from the camera. On my 7D it's a few frames per second. A newer body may be quicker.
-- **RAW capture.** Saves the camera's RAW file (`.CR2`) straight to a folder you pick, untouched. What the camera makes is what you get.
+- **RAW capture.** Saves the camera's RAW file straight to a folder you pick, untouched, under whatever type the body actually produced (`.CR2` on my 7D, `.CR3` on newer bodies).
 - **Work through a roll.** Tap Space to fire a frame, so working through a roll of negatives is quick.
 - **Exposure controls.** ISO, shutter, aperture, and white-balance Kelvin, all from the Mac. A control greys out when the current mode makes it read-only, so aperture priority just works.
 - **Focus check.** Hold Shift to punch in using the camera's sensor and confirm your focus is sharp.
 - **Focus control.** Keyboard shortcuts for stepping focus, when the conditions are right (lens set to AF, live view on).
 - **Focus peaking.** An adjustable overlay that attempts to highlight what's in focus (far from perfect).
+- **Live histogram.** Sampled from the frame the camera sends, before any of the preview adjustments below, so it tells you what the sensor is actually being asked to record rather than what the corrected preview looks like.
+
+## Working with negatives
+
+These came out of scanning film, which is what I built the app for. Every one of them changes only what you see on screen. The RAW that lands in your folder is the frame the camera shot, untouched.
+
+- **See the positive.** Invert the preview so a negative reads as the picture it will become, which makes framing and dust a lot easier to judge.
+- **Black and white.** Drop the colour out of the preview. Raw pixels off a B&W negative carry no useful colour anyway, and exposure is easier to read without it.
+- **Set white balance by clicking.** Click the unexposed film base and the preview corrects relative to it. Per-channel gains rather than a colour temperature, because a film base is off-neutral on both axes and a Kelvin control can only slide between blue and amber.
+- **Rotate the preview.** Quarter turns, for when the holder can't be squared up. With medium format that happens to me a lot.
+- **Three zoom levels.** Fit, 100%, and a 500% punch-in that uses the camera's own sensor zoom rather than upscaling a preview JPEG, so it shows real detail when you are checking focus.
+- **Provenance in the file.** Optionally writes the camera the negative was shot on and the film stock into the RAW, along with a record of the preview adjustments you had applied, so a later tool can read what you were looking at. Nothing is written unless you turn it on.
 
 ## Honest caveats
 
-I'd rather be upfront than oversell it.
-
 - The focus zoom works, and you can get sharp focus with it. It just doesn't always land on the exact spot you click.
-- I've only tested it on my 7D and a friend's 70D. I don't know how many other EOS bodies it works with.
+- At 100% zoom, clicking to move the zoom box and using the eyedropper both land in the wrong place. Use Fit or 500% for those. It's fixed in the next release.
+- Tested on a Canon EOS 7D (by me), a 70D and an R5 (by contributors). I don't know how many other EOS bodies it works with.
 - Other cameras, or other brands, might be straightforward to add, since it's built on the open-source libgphoto2 project. You would still have to work through it with the camera in hand.
 
 It sticks to one job: tethered capture. It doesn't develop RAW, correct lenses, shoot video, do time-lapse, or sync anywhere.
@@ -36,7 +47,20 @@ It sticks to one job: tethered capture. It doesn't develop RAW, correct lenses, 
 
 ## Supported cameras
 
-My Canon EOS 7D and a friend's 70D. That is the whole list so far. It should work with other EOS bodies that [libgphoto2 supports](https://www.gphoto.org/proj/libgphoto2/support.php), but I have not tried them. If you run it on another body, [tell me on the repo](https://github.com/chriscantey/film-tether/issues) and I will add it here.
+Tested on a Canon EOS 7D (by me), a 70D and an R5 (by contributors). That is the whole list so far. It should work with other EOS bodies that [libgphoto2 supports](https://www.gphoto.org/proj/libgphoto2/support.php), but I have not tried them. If you run it on another body, [tell me on the repo](https://github.com/chriscantey/film-tether/issues) and I will add it here.
+
+## Contributors
+
+People who have put work into this, and what they did. Huge thanks to everyone here.
+
+- [@eileendarby](https://github.com/eileendarby). Canon R5 support, and most of the film-scanning preview work in 0.3.0: invert, black and white, click-to-set white balance, preview rotation, the Fit zoom mode, and the menu bar fixes.
+- [Melody Murray](https://melodymurray.com). Testing on the Canon EOS 70D, which is the only reason that body is on the supported list.
+
+## Contributing
+
+Pull requests and issues are both welcome, and I read all of them.
+
+One thing worth knowing first. This repo is a published copy of a private working repo, so pull requests here get adapted by hand rather than merged directly. Your work still lands and you still get credit, in the Contributors list above and with a `Co-Authored-By` line on the commit that carries it.
 
 ## Install
 

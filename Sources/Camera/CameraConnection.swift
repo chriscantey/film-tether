@@ -3,7 +3,7 @@ import CGPhoto2
 
 /// USB enumeration + reconnection state machine. Polls libgphoto2's `gp_camera_autodetect`
 /// (no hotplug API in libgphoto2 itself), claims/releases macOS's PTP layer around `open()`,
-/// publishes state via `stateStream`. Matches any Canon EOS body, tested with 7D + 70D.
+/// publishes state via `stateStream`. Matches any Canon EOS body, tested with 7D, 70D and R5.
 @CameraActor
 public final class CameraConnection {
     public enum ConnectionState: Sendable, Equatable {
@@ -90,7 +90,7 @@ public final class CameraConnection {
     }
 
     /// Scan via `gp_camera_autodetect` for any Canon EOS body.
-    /// Tested with the 7D and 70D; should work with any Canon EOS body that libgphoto2
+    /// Tested with the 7D, 70D and R5. Should work with any Canon EOS body that libgphoto2
     /// supports (which is essentially the whole product line). We filter by name here
     /// rather than USB ID because the libgphoto2 enumeration doesn't easily expose USB IDs;
     /// the per-body USB-claim release uses Canon's vendor ID via ImageCaptureCore.
@@ -128,7 +128,7 @@ public final class CameraConnection {
         defer { connectInFlight = false }
         transition(.enumerating)
 
-        // Gentle-first strategy (D24 finding): without ImageCaptureCore in our process
+        // Gentle-first strategy: without ImageCaptureCore in our process
         // ptpcamerad doesn't preemptively grab the USB, so a clean `gp_camera_init` on
         // first try usually wins. Skipping the killall + eject on attempt 1 avoids
         // disturbing the camera unnecessarily, those are reserved for the retry path

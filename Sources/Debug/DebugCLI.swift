@@ -1,6 +1,9 @@
 import Foundation
 import Camera
 import CGPhoto2
+import CoreGraphics
+import ImageIO
+import Scan
 
 /// FilmTetherDebug, headless CLI for exercising the Camera module without the
 /// SwiftUI app. Critical for autonomous testing over SSH: the GUI app needs a
@@ -18,6 +21,7 @@ struct DebugCLI {
             exit(2)
         }
         CameraEnvironment.setup()
+        installStderrGphotoLog()  // no-op unless EOS_DEBUG=1
         let cmd = args[1]
         let rest = Array(args.dropFirst(2))
         do {
@@ -39,9 +43,23 @@ struct DebugCLI {
         case "set-widget":
             guard rest.count >= 2 else { fail("set-widget needs NAME VALUE") }
             try await runSetWidget(rest[0], rest[1])
+        case "choices":
+            guard let name = rest.first else { fail("choices needs NAME") }
+            try await runChoices(name)
         case "capture":
             let dir = rest.first ?? defaultCaptureDir()
-            try await runCapture(toDir: dir)
+            let camera = rest.count > 1 ? rest[1] : ""
+            let film = rest.count > 2 ? rest[2] : ""
+            try await runCapture(toDir: dir, camera: camera, film: film)
+        case "tag":
+            var tagArgs = rest
+            let embed = tagArgs.contains("--embed")
+            tagArgs.removeAll { $0 == "--embed" }
+            guard let path = tagArgs.first else { fail("tag needs FILE [CAMERA] [FILM] [--embed]") }
+            let camera = tagArgs.count > 1 ? tagArgs[1] : ""
+            let film = tagArgs.count > 2 ? tagArgs[2] : ""
+            if embed { MetadataWriter.backend = .embedded }
+            runTag(file: path, camera: camera, film: film)
         case "lv-start":      try await runLVStart()
         case "lv-stop":       try await runLVStop()
         case "preview":
@@ -115,17 +133,55 @@ struct DebugCLI {
         print("set \(name)=\(value)")
     }
 
+    /// Dump a RADIO/MENU widget's full choice list plus its current value.
+    /// Diagnostic for "why is X missing from a picker": the app's menus show
+    /// exactly these strings, so this reveals what libgphoto2/the body report.
     @CameraActor
-    static func runCapture(toDir dirString: String) async throws {
+    static func runChoices(_ name: String) async throws {
+        let sess = try await openSession(); defer { sess.close() }
+        let props = CameraProperties(session: sess)
+        let current = (try? await props.getString(name)) ?? "?"
+        let list = try await props.choices(for: name)
+        print("\(name) current=\(current) (\(list.count) choices)")
+        for (i, c) in list.enumerated() {
+            print(String(format: "  [%2d] %@", i, c))
+        }
+    }
+
+    @CameraActor
+    static func runCapture(toDir dirString: String, camera: String = "", film: String = "") async throws {
         let dir = URL(fileURLWithPath: NSString(string: dirString).expandingTildeInPath)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let sess = try await openSession(); defer { sess.close() }
         let props = CameraProperties(session: sess)
         let cap = CameraCapture(session: sess, properties: props)
+        let meta = CaptureMetadata(camera: camera, film: film)
         let before = Date()
-        let result = try await cap.capture(to: dir)
+        let result = try await cap.capture(to: dir, metadata: meta)
         let dt = Date().timeIntervalSince(before)
-        print("OK capture=\(result.path.path) iso=\(result.iso ?? "?") Tv=\(result.shutter ?? "?") Av=\(result.aperture ?? "?") elapsed=\(String(format: "%.1f", dt))s")
+        let sidecar = result.sidecarPath.map { " sidecar=\($0.path)" } ?? ""
+        print("OK capture=\(result.path.path) iso=\(result.iso ?? "?") Tv=\(result.shutter ?? "?") Av=\(result.aperture ?? "?") elapsed=\(String(format: "%.1f", dt))s\(sidecar)")
+    }
+
+    /// Write a metadata sidecar for an EXISTING raw, no camera needed. Use this
+    /// to generate a tagged `.xmp` next to a test CR2, convert it in FilmLab with
+    /// "Include metadata" checked, then `exiftool` the export to confirm the
+    /// camera/film survived. Decides sidecar-vs-embed for the pipeline.
+    nonisolated static func runTag(file path: String, camera: String, film: String) {
+        let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+        let meta = CaptureMetadata(camera: camera, film: film)
+        guard !meta.isEmpty else { fail("tag needs at least a CAMERA or FILM value") }
+        do {
+            if let out = try MetadataWriter.write(meta, forRAW: url) {
+                print("OK wrote \(out.path)")
+                print("--- XMP ---")
+                print(meta.xmpPacket() ?? "")
+            } else {
+                print("no-op (nothing to write)")
+            }
+        } catch {
+            fail("tag failed: \(error)")
+        }
     }
 
     @CameraActor
@@ -443,11 +499,11 @@ struct DebugCLI {
             let sess = try await openSession(); defer { sess.close() }
             let props = CameraProperties(session: sess)
             let cap = CameraCapture(session: sess, properties: props)
-            let result = try await cap.capture(to: captureDir, filenamePattern: "DEBUG_{ymd}_{hms}_{seq}.CR2")
+            let result = try await cap.capture(to: captureDir, filenamePattern: "DEBUG_{ymd}_{hms}_{seq}.{ext}")
             let attrs = try FileManager.default.attributesOfItem(atPath: result.path.path)
             let size = (attrs[.size] as? Int) ?? 0
             guard size > 1_000_000 else {
-                throw DebugError("CR2 too small (\(size) bytes)")
+                throw DebugError("RAW too small (\(size) bytes)")
             }
             return "path=\(result.path.lastPathComponent) bytes=\(size) iso=\(result.iso ?? "?") Tv=\(result.shutter ?? "?")"
         })
@@ -500,6 +556,18 @@ struct DebugCLI {
         print("end=\(Date())")
     }
 
+    /// With EOS_DEBUG=1, pipe libgphoto2's internal logging straight to stderr.
+    /// The GUI app bridges to unified logging instead (CameraLog); for a
+    /// headless CLI, stderr is greppable and needs no `log show`.
+    static func installStderrGphotoLog() {
+        guard ProcessInfo.processInfo.environment["EOS_DEBUG"] == "1" else { return }
+        gp_log_add_func(GP_LOG_DEBUG, { _, domain, message, _ in
+            let d = domain.map { String(cString: $0) } ?? "?"
+            let m = message.map { String(cString: $0) } ?? "?"
+            FileHandle.standardError.write(Data("gp[\(d)] \(m)\n".utf8))
+        }, nil)
+    }
+
     @CameraActor
     static func openSession() async throws -> CameraSession {
         let sess = try CameraSession()
@@ -534,7 +602,12 @@ struct DebugCLI {
           snapshot                Dump current property snapshot
           widget NAME             Read a raw widget value
           set-widget NAME VALUE   Write a raw widget value
-          capture [DIR]           Fire Immediate release + download CR2
+          choices NAME            List a RADIO/MENU widget's choices + current value
+          capture [DIR] [CAMERA] [FILM]
+                                  Fire release + download the RAW under its true extension
+                                  (and the JPEG too, if quality is RAW+JPEG) + write metadata
+          tag FILE [CAMERA] [FILM] [--embed]
+                                  Write metadata for an EXISTING raw (no camera)
           lv-start                Engage live view briefly (sanity check)
           lv-stop                 Disengage live view (mirror down)
           preview [DIR]           Save one LV JPEG (default /tmp) + print its dimensions

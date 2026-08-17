@@ -10,12 +10,20 @@ libgphoto2 source is at https://github.com/gphoto/libgphoto2.
 Film Tether.app/
   Contents/
     Frameworks/
-      libgphoto2.*.dylib
-      libgphoto2_port.*.dylib
+      libgphoto2.6.dylib
+      libgphoto2_port.12.dylib
+      libexif.12.dylib        (transitive)
+      libintl.8.dylib         (transitive)
+      libjpeg.8.dylib         (transitive)
+      libltdl.7.dylib         (transitive)
+      libusb-1.0.0.dylib      (transitive)
     Resources/
       camlibs/    (camera drivers, loaded at runtime)
       iolibs/     (USB transport, loaded at runtime)
 ```
+
+Only the two libgphoto2 dylibs are LGPL. The rest are its dependencies and
+carry their own licences.
 
 To see the bundled version:
 
@@ -47,8 +55,9 @@ cp -a "$APP/Contents/Resources/camlibs" "$APP/Contents/Resources/camlibs.bak"
 cp /tmp/my-libgphoto2/lib/libgphoto2.*.dylib "$APP/Contents/Frameworks/"
 cp /tmp/my-libgphoto2/lib/libgphoto2_port.*.dylib "$APP/Contents/Frameworks/"
 
-# swap the camlibs and iolibs
+# swap the camlibs and iolibs (recreate the directories, cp needs them present)
 rm -rf "$APP/Contents/Resources/camlibs" "$APP/Contents/Resources/iolibs"
+mkdir -p "$APP/Contents/Resources/camlibs" "$APP/Contents/Resources/iolibs"
 cp -R /tmp/my-libgphoto2/lib/libgphoto2/*/. "$APP/Contents/Resources/camlibs/"
 cp -R /tmp/my-libgphoto2/lib/libgphoto2_port/*/. "$APP/Contents/Resources/iolibs/"
 ```

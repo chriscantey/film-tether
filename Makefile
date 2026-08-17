@@ -1,7 +1,7 @@
-.PHONY: build bundle run run-debug clean tests check format help doctor dist dist-compat dist-universal debug debug-test
+.PHONY: build bundle run run-debug clean tests check format help doctor dist dist-compat dist-universal debug debug-test patched-camlib
 
 APP_NAME       := FilmTether
-# Display-friendly bundle filename — macOS supports spaces in .app paths,
+# Display-friendly bundle filename, macOS supports spaces in .app paths,
 # Finder/menubar/Dock prefer it (matches CFBundleName + CFBundleDisplayName).
 DISPLAY_NAME   := Film Tether
 BUNDLE         := $(DISPLAY_NAME).app
@@ -11,11 +11,18 @@ BUILD_DIR      := .build/$(ARCH)-apple-macosx/$(CONFIG)
 BINARY         := $(BUILD_DIR)/$(APP_NAME)
 DEBUG_BIN      := $(BUILD_DIR)/FilmTetherDebug
 
-# Brew env — exported so `swift build` and `pkg-config` find libgphoto2 on Apple Silicon
-# even when run from contexts that don't source ~/.zshrc (Make, GUI launchers, agents).
+# Brew env, exported so `swift build` and `pkg-config` find libgphoto2 on Apple Silicon
+# even when run from contexts that don't source ~/.zshrc (Make, GUI launchers).
 BREW_PREFIX   := $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)
 export PKG_CONFIG_PATH := $(BREW_PREFIX)/lib/pkgconfig:$(PKG_CONFIG_PATH)
 export PATH := $(BREW_PREFIX)/bin:$(PATH)
+
+# Repo-local patched ptp2 camlib (built by `make patched-camlib`, see
+# patches/eos-imageformat-L-combos.diff), used only when it matches the
+# installed brew libgphoto2 version. bundle.sh does its own equivalent check;
+# this one routes the headless debug CLI through the same patched camlib.
+GP_VERSION      := $(shell basename "$$(find "$$(brew --prefix libgphoto2 2>/dev/null)/lib/libgphoto2" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)" 2>/dev/null)
+PATCHED_CAMLIBS := $(if $(wildcard vendor/camlibs/$(GP_VERSION)/ptp2.so),$(CURDIR)/vendor/camlibs/$(GP_VERSION))
 
 help:
 	@echo "Film Tether build"
@@ -28,6 +35,7 @@ help:
 	@echo "  make dist     Build + bundle + zip for friend-handoff (no brew needed on their Mac)"
 	@echo "  make debug-test  Run the headless autonomous test suite against the 7D"
 	@echo "  make debug CMD=\"…\"  Run a single CLI subcommand (snapshot, capture, meter, …)"
+	@echo "  make patched-camlib  Build the patched ptp2.so (EOS R5 'RAW + L' Format fix)"
 	@echo "  make clean    Remove .build/ and $(BUNDLE)"
 	@echo "  make check    Static checks (swift package describe + plist lint)"
 	@echo ""
@@ -44,13 +52,13 @@ tests:
 
 # Run the autonomous headless test suite against a real 7D. Assumes the GUI
 # app is NOT running (the USB can only be claimed by one process at a time).
-# Output is PASS/FAIL per check with evidence — exactly what to skim post-cycle.
+# Output is PASS/FAIL per check with evidence, exactly what to skim post-cycle.
 debug-test: build
 	@if pgrep -x $(APP_NAME) >/dev/null 2>&1; then \
 		echo "Film Tether GUI is running — quit it first (USB is single-claim)"; \
 		exit 1; \
 	fi
-	@$(DEBUG_BIN) test
+	@$(if $(PATCHED_CAMLIBS),CAMLIBS="$(PATCHED_CAMLIBS)") $(DEBUG_BIN) test
 
 # Run a single CLI subcommand without launching the GUI. Examples:
 #   make debug CMD="snapshot"
@@ -62,7 +70,7 @@ debug: build
 		echo "Film Tether GUI is running — quit it first (USB is single-claim)"; \
 		exit 1; \
 	fi
-	@$(DEBUG_BIN) $(CMD)
+	@$(if $(PATCHED_CAMLIBS),CAMLIBS="$(PATCHED_CAMLIBS)") $(DEBUG_BIN) $(CMD)
 
 bundle: build
 	@bash scripts/bundle.sh "$(BUNDLE)" "$(APP_NAME)" "$(BINARY)"
@@ -70,7 +78,7 @@ bundle: build
 run: bundle
 	@open "$(BUNDLE)"
 
-# Launch with EOS_DEBUG=1 — every Camera state change, every libgphoto2 internal
+# Launch with EOS_DEBUG=1, every Camera state change, every libgphoto2 internal
 # log message lands in unified logging. Stream it from another terminal with:
 #   log stream --predicate 'subsystem == "co.wonders.filmtether"' --info --debug
 run-debug: bundle
@@ -80,6 +88,14 @@ run-debug: bundle
 	@echo ""
 	@echo "Stream the app's logs (run in another terminal):"
 	@echo "  log stream --predicate 'subsystem == \"co.wonders.filmtether\"' --info --debug"
+
+# Build the patched ptp2 camlib: fixes "RAW + L"/"cRAW + L" missing from the
+# Format menu on the EOS R5 (libgphoto2 decode bug; patch + details in
+# patches/eos-imageformat-L-combos.diff). Output lands in vendor/camlibs/ and
+# is picked up automatically by bundle/run/dist and the debug targets.
+# Re-run after a `brew upgrade libgphoto2`.
+patched-camlib:
+	@bash scripts/build-patched-camlib.sh
 
 clean:
 	@rm -rf .build "$(BUNDLE)"
@@ -109,7 +125,7 @@ dist: bundle
 # Build a friend bundle that runs on an OLDER macOS than this host. Pulls the
 # Homebrew bottles for an older OS tag (default macOS 14 / Sonoma on Apple
 # Silicon), vendors those instead of your native ones, and zips separately.
-# Same packages as your normal build — just compiled for the older OS.
+# Same packages as your normal build, just compiled for the older OS.
 #   make dist-compat                    # arm64_sonoma (macOS 14)
 #   make dist-compat TAG=arm64_sequoia  # macOS 15
 TAG ?= arm64_sonoma
@@ -124,7 +140,7 @@ dist-compat:
 	echo "       Send this one to the friend on the older macOS; clear quarantine as above."
 
 # Build ONE universal (arm64 + x86_64) bundle targeting macOS Sonoma (14)+,
-# entirely on this host — fetches both-arch Homebrew bottles, builds each slice,
+# entirely on this host, fetches both-arch Homebrew bottles, builds each slice,
 # lipo-merges. This is the publish/distribution artifact (GitHub) AND what runs
 # native on Apple Silicon. Set DEVELOPER_ID=... to sign for real.
 #   make dist-universal
