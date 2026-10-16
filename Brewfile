@@ -1,4 +1,4 @@
-# Homebrew dependencies for Canon 7D Controller.
+# Homebrew dependencies for Film Tether.
 # Installed by `brew bundle` (and by `scripts/bootstrap.sh` on first run).
 
 brew "libgphoto2"
@@ -10,5 +10,9 @@ brew "pkg-config"
 #   gphoto2 --get-config X     read a property
 brew "gphoto2"
 
-# Optional: source-code formatting; harmless if you don't use it.
+# Used by scripts/fetch-compat-libs.sh to read a bottle's URL and checksum
+# from Homebrew's API.
+brew "jq"
+
+# Optional: source-code formatting.
 # brew "swift-format"

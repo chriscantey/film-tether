@@ -1,21 +1,26 @@
 import Foundation
 
-/// Pretty-label formatter for libgphoto2 widget values exposed by the Canon EOS 7D's
-/// PTP driver. The driver returns terse strings, `"160"` for ISO, `"2.8"` for aperture,
-/// `"0.005"` for a 1/200s shutter, `"AV"` for the mode dial, that are correct but ugly.
-/// This file maps them to display strings a photographer would actually recognize.
+/// Display labels for libgphoto2 widget values exposed by the Canon EOS 7D's PTP
+/// driver. The driver returns terse strings, `"160"` for ISO, `"2.8"` for aperture,
+/// `"AV"` for the mode dial, and this file maps them to the strings a photographer
+/// recognizes.
 ///
-/// All methods are pure and synchronous, call from any actor. Unknown values pass
-/// through unchanged so we never *lose* information; we only beautify what we recognize.
+/// All methods are pure and synchronous, so call them from any actor. Each label
+/// function passes an unknown value through, trimmed of spaces.
+/// `transform(choices:)` drops a choice whose label repeats an earlier one.
+///
+/// A lone em-dash (U+2014) is the app's placeholder for a value the body has
+/// not reported. The app compares against that exact string (AppModel,
+/// StatusFooter), so the functions here pass it through and it stays an
+/// em-dash.
 public enum PropertyLabels {
 
     // MARK: - ISO
 
-    /// `"160"` → `"ISO 160"`. Numeric values get the prefix; `"Auto"` stays `"Auto"`.
+    /// `"160"` → `"ISO 160"`. Numeric values get the prefix, `"Auto"` stays `"Auto"`.
     public static func iso(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty || trimmed == "—" { return trimmed }
-        // "Auto" and friends pass through.
         if Int(trimmed) != nil {
             return "ISO \(trimmed)"
         }
@@ -39,65 +44,64 @@ public enum PropertyLabels {
 
     // MARK: - Shutter
 
-    /// libgphoto2's Canon driver reports shutter speed as decimal seconds:
-    ///   `"30"` → 30 seconds (long), `"0.5"` → 1/2, `"0.005"` → 1/200, `"0.0001"` → 1/8000.
-    /// Plus special strings: `"auto"`, `"bulb"`, `"Bulb"`.
-    /// Convert to the photographer-friendly form a 7D shows on its top LCD.
+    /// Shutter speed as libgphoto2's Canon driver reports it. On the 7D that is a
+    /// fraction from 1/4 s up (`"1/200"`), which passes through, and whole or decimal
+    /// seconds below that (`"30"`, `"2.5"`, `"0.8"`). Plus special strings: `"auto"`,
+    /// `"bulb"`, `"Bulb"`.
+    ///
+    /// Decimal seconds show as seconds: `"2.5s"`, `"30s"`, and under one second
+    /// `"0.8s"`, with trailing zeros dropped. The driver lists 0.8, 0.7, 0.6, 0.5,
+    /// 0.4 and 0.3 between 1 s and 1/4, and each keeps its own label so every one
+    /// of them stays in the menu.
     public static func shutter(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty || trimmed == "—" { return trimmed }
         let lower = trimmed.lowercased()
         if lower == "auto" { return "Auto" }
         if lower == "bulb" { return "Bulb" }
-        // Some libgphoto2 builds report "1/200" directly, pass through.
         if trimmed.contains("/") { return trimmed }
-        // Some builds report fractions like "0.005" or "1/200", handle both.
         if let s = Double(trimmed) {
             if s >= 1.0 {
-                // Long exposure: integer seconds for whole values, decimal otherwise.
                 if s == s.rounded() {
                     return "\(Int(s))s"
                 }
                 return String(format: "%.1fs", s)
             }
-            // Fractional second: convert to "1/N" with N rounded to the nearest standard stop.
-            let inverse = 1.0 / s
-            let rounded = roundToStandardShutter(inverse)
-            return "1/\(rounded)"
+            var text = String(format: "%.2f", s)
+            while text.hasSuffix("0") { text.removeLast() }
+            if text.hasSuffix(".") { text.removeLast() }
+            return "\(text)s"
         }
         return trimmed
-    }
-
-    /// Round an inverse-shutter value (e.g. 199.something) to the nearest standard
-    /// shutter denominator. Canon's standard ladder: 4000, 3200, 2500, 2000, 1600,
-    /// 1250, 1000, 800, 640, 500, 400, 320, 250, 200, 160, 125, 100, 80, 60, 50,
-    /// 40, 30, 25, 20, 15, 13, 10, 8, 6, 5, 4 (third-stop increments).
-    /// We round to the closest member of this set; unknown values keep their raw integer.
-    private static func roundToStandardShutter(_ inverse: Double) -> Int {
-        let ladder: [Int] = [
-            8000, 6400, 5000, 4000, 3200, 2500, 2000, 1600, 1250, 1000,
-            800, 640, 500, 400, 320, 250, 200, 160, 125, 100,
-            80, 60, 50, 40, 30, 25, 20, 15, 13, 10,
-            8, 6, 5, 4, 3, 2,
-        ]
-        let candidate = ladder.min(by: { abs(Double($0) - inverse) < abs(Double($1) - inverse) })
-        return candidate ?? Int(inverse.rounded())
     }
 
     // MARK: - White balance
 
     /// Canon WB mode names. libgphoto2 may report `"Auto"`, `"Daylight"`,
     /// `"Cloudy"`, `"Tungsten"`, `"Fluorescent"`, `"Flash"`, `"Custom"`,
-    /// `"Color Temperature"` (the Kelvin-picker mode). We leave these as-is;
-    /// they're already photographer-readable. The numeric Kelvin field is
-    /// formatted by `kelvin(_:)`.
+    /// `"Color Temperature"` (the Kelvin-picker mode). They are already
+    /// photographer-readable and pass through, trimmed of spaces, with one
+    /// exception.
+    ///
+    /// `"Color Temperature"` is shown as "Temperature", which ties
+    /// "Fluorescent" for longest at 88.4pt, the width ExposureBar's WB Mode
+    /// slot is sized from. The Kelvin value itself lives in the Temperature
+    /// stepper beside the picker.
     public static func whiteBalance(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty || trimmed == "—" { return trimmed }
+        // Tolerant of Canon/libgphoto2 spelling drift: colour, no space,
+        // "Temp" abbreviated. Anything that is the color-temperature mode
+        // and nothing else.
+        let squashed = trimmed.lowercased()
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "colour", with: "color")
+        if squashed == "colortemperature" || squashed == "colortemp" { return "Temperature" }
         return trimmed
     }
 
-    /// `5600` → `"5600K"`. Already-suffixed pass through.
+    /// `5600` → `"5600K"`. nil, zero or a negative value shows the placeholder
+    /// dash.
     public static func kelvin(_ raw: Int?) -> String {
         guard let k = raw, k > 0 else { return "—" }
         return "\(k)K"
@@ -133,7 +137,7 @@ public enum PropertyLabels {
 
     /// Canon image-format values from libgphoto2's choices on the 7D include strings
     /// like `"RAW"`, `"RAW + Large Fine JPEG"`, `"Large Fine JPEG"`, `"Small Normal JPEG"`.
-    /// Pass through, they're already readable.
+    /// They pass through, since they're already readable.
     public static func imageFormat(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty || trimmed == "—" { return trimmed }
@@ -143,7 +147,7 @@ public enum PropertyLabels {
     // MARK: - Battery level
 
     /// Some libgphoto2 builds report battery as percentage (`"75%"`), others as integer
-    /// (`"75"`). Normalize to always include `%`.
+    /// (`"75"`). A bare integer gets `%`.
     public static func battery(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty || trimmed == "—" { return trimmed }
@@ -154,8 +158,8 @@ public enum PropertyLabels {
 
     // MARK: - Choices
 
-    /// Apply the per-property label transform across a choice list. Used by ExposureBar's
-    /// dropdown menus so the displayed options match the displayed current value.
+    /// Apply the per-property label transform across a choice list, so the
+    /// displayed options match the displayed current value.
     public static func transform(choices: [String], forProperty prop: String) -> [(raw: String, label: String)] {
         let formatter: (String) -> String
         switch prop {
@@ -169,9 +173,9 @@ public enum PropertyLabels {
         default:              formatter = { $0 }
         }
         // Bodies occasionally repeat entries, and two distinct raw values can
-        // format to the same display label, either way the menu shows
-        // duplicates the user can't distinguish. Keep the first occurrence,
-        // preserve order.
+        // format to the same display label. Either way the menu would show
+        // duplicates the user can't distinguish, so keep the first occurrence
+        // and preserve order.
         var seenRaw = Set<String>()
         var seenLabel = Set<String>()
         return choices.compactMap { raw in

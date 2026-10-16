@@ -106,18 +106,18 @@ final class PreviewRotationTests: XCTestCase {
     }
 
     /// The pixel-level counterpart of `testTopLeftCornerTravelsClockwise`. This
-    /// is what actually pins down the sign of the rotation angle in the CGContext
+    /// is what pins down the sign of the rotation angle in the CGContext
     /// (which is y-up, so a visual clockwise turn is a *negative* angle).
     func testRotationMovesTheMarkedPixelClockwise() throws {
         let src = try makeImage(width: 4, height: 2, redAt: (0, 0))   // top-left
 
-        let r90 = try XCTUnwrap(PreviewRotation.cw90.rotate(src))     // 2×4
+        let r90 = try XCTUnwrap(PreviewRotation.cw90.rotate(src))     // 2x4
         XCTAssertEqual(findRedPixel(r90), Pixel(1, 0), "cw90 should land top-right")
 
-        let r180 = try XCTUnwrap(PreviewRotation.cw180.rotate(src))   // 4×2
+        let r180 = try XCTUnwrap(PreviewRotation.cw180.rotate(src))   // 4x2
         XCTAssertEqual(findRedPixel(r180), Pixel(3, 1), "cw180 should land bottom-right")
 
-        let r270 = try XCTUnwrap(PreviewRotation.cw270.rotate(src))   // 2×4
+        let r270 = try XCTUnwrap(PreviewRotation.cw270.rotate(src))   // 2x4
         XCTAssertEqual(findRedPixel(r270), Pixel(0, 3), "cw270 should land bottom-left")
     }
 

@@ -1,25 +1,37 @@
 import Foundation
 import CGPhoto2
 
-/// Internal widget-tree helpers shared by `CameraSession`, `CameraProperties`,
-/// `LiveView`, and `LiveZoom`. Not part of the public API.
+/// Internal widget-tree helpers. Not part of the public API.
 ///
-/// libgphoto2's config is exposed as a tree of `CameraWidget*` nodes; leaves carry
-/// typed values. These helpers walk the tree, read/write a single leaf, and call
+/// libgphoto2's config is exposed as a tree of `CameraWidget*` nodes, and leaves carry
+/// typed values. These helpers find a leaf by name, read/write it, and call
 /// `gp_camera_set_single_config` (more efficient than `gp_camera_set_config` which
 /// writes the entire tree on every change).
 enum WidgetHelpers {
-    /// Resolve a leaf widget by name from the camera's config tree.
+    /// The `gp_camera_get_config` behind `resolveLeaf`, and so behind the
+    /// per-name reads and writes that use it: it rebuilds the whole tree each
+    /// call, whichever leaf the caller wants. Caller owns the returned root.
+    static func fetchRoot(
+        camera: UnsafeMutablePointer<Camera>,
+        context: OpaquePointer
+    ) throws -> OpaquePointer? {
+        var root: OpaquePointer? = nil
+        try CameraError.check(gp_camera_get_config(camera, &root, context))
+        return root
+    }
+
+    /// Resolve a leaf widget by name from the camera's config tree. Costs one
+    /// full-tree `fetchRoot` per call.
     /// Caller owns the returned root and must `gp_widget_unref(root)` after use.
-    /// The leaf is borrowed from the root, do NOT unref it separately.
+    /// The leaf is borrowed from the root, so do not unref it separately.
     static func resolveLeaf(
         camera: UnsafeMutablePointer<Camera>,
         context: OpaquePointer,
         name: String
     ) throws -> (root: OpaquePointer, leaf: OpaquePointer) {
-        var root: OpaquePointer? = nil
-        try CameraError.check(gp_camera_get_config(camera, &root, context))
-        guard let root else { throw CameraError.propertyNotFound(name: name) }
+        guard let root = try fetchRoot(camera: camera, context: context) else {
+            throw CameraError.propertyNotFound(name: name)
+        }
 
         var leaf: OpaquePointer? = nil
         let rc = name.withCString { cName in
@@ -78,18 +90,6 @@ enum WidgetHelpers {
         }
     }
 
-    /// Read a RANGE-typed widget as Float.
-    static func readFloat(_ widget: OpaquePointer) throws -> Float {
-        let type = widgetType(widget)
-        guard type == GP_WIDGET_RANGE else {
-            throw CameraError.widgetTypeMismatch(expected: "RANGE", got: typeName(type))
-        }
-        var value: Float = 0
-        try withUnsafeMutablePointer(to: &value) { ptr in
-            try CameraError.check(gp_widget_get_value(widget, UnsafeMutableRawPointer(ptr)))
-        }
-        return value
-    }
 
     static func writeFloat(_ widget: OpaquePointer, value: Float) throws {
         let type = widgetType(widget)
@@ -126,7 +126,32 @@ enum WidgetHelpers {
         }
     }
 
-    /// Enumerate RADIO/MENU choices.
+    /// Read a DATE widget, which libgphoto2 stores as Unix seconds in an Int32.
+    static func readDate(_ widget: OpaquePointer) throws -> Int32 {
+        let type = widgetType(widget)
+        guard type == GP_WIDGET_DATE else {
+            throw CameraError.widgetTypeMismatch(expected: "DATE", got: typeName(type))
+        }
+        var value: Int32 = 0
+        try withUnsafeMutablePointer(to: &value) { ptr in
+            try CameraError.check(gp_widget_get_value(widget, UnsafeMutableRawPointer(ptr)))
+        }
+        return value
+    }
+
+    /// Write a DATE widget as Unix seconds. Caller must follow with `commit` to push to camera.
+    static func writeDate(_ widget: OpaquePointer, value: Int32) throws {
+        let type = widgetType(widget)
+        guard type == GP_WIDGET_DATE else {
+            throw CameraError.widgetTypeMismatch(expected: "DATE", got: typeName(type))
+        }
+        var v = value
+        try withUnsafeMutablePointer(to: &v) { ptr in
+            try CameraError.check(gp_widget_set_value(widget, UnsafeMutableRawPointer(ptr)))
+        }
+    }
+
+
     static func choices(_ widget: OpaquePointer) throws -> [String] {
         let type = widgetType(widget)
         guard type == GP_WIDGET_RADIO || type == GP_WIDGET_MENU else {

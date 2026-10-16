@@ -3,47 +3,44 @@ import CGPhoto2
 
 /// Fires the shutter via `gp_camera_capture(GP_CAPTURE_IMAGE)` and downloads
 /// the resulting file(s) to a destination folder, byte-for-byte as the camera
-/// produced them. The saved extension always comes from the camera's own
-/// filename (.CR2 on a 7D, .CR3 on an R5, .JPG for JPEG quality settings),
-/// never from the user's filename pattern: an earlier version hardcoded .CR2
-/// in the pattern, which mislabeled R5 CR3/JPEG bytes as CR2 and made macOS
-/// misreport the format. When the body is set to RAW+JPEG it creates TWO
-/// files per shot but gp_camera_capture returns only the first; the companion
-/// arrives on the event queue, so we drain FILE_ADDED events after the
-/// primary download and save every file of the capture (same base name,
-/// each with its own true extension), matching EOS Utility behavior.
+/// produced them. When the camera's filename has an extension (.CR2 on a 7D,
+/// .CR3 on an R5, .JPG for JPEG quality settings), the saved name ends in it
+/// whatever extension the user's filename pattern gives, so a pattern ending
+/// in .CR2 cannot mislabel CR3 or JPEG bytes and make macOS misreport the format.
+/// When the body is set to RAW+JPEG it creates two files per shot but
+/// gp_camera_capture returns only the first. The companion arrives on the
+/// event queue, so capture drains FILE_ADDED events before downloading and
+/// saves every file of the capture (same base name, each with its own true
+/// extension).
 ///
-/// **Why gp_camera_capture and not eosremoterelease=Immediate.** Using
-/// `eosremoterelease=Immediate` (PTP value 5) was wrong: empirical testing
-/// showed that this widget write doesn't actually fire the shutter on this 7D.
-/// `gphoto2 --set-config eosremoterelease=5 --wait-event-and-download`
-/// produced zero files across three attempts. Meanwhile
+/// Why gp_camera_capture and not eosremoterelease=Immediate: writing
+/// `eosremoterelease=Immediate` (PTP value 5) did not fire the shutter on
+/// the 7D in testing: `gphoto2 --set-config eosremoterelease=5
+/// --wait-event-and-download` produced zero files in three attempts, while
 /// `gphoto2 --capture-image-and-download` (which is exactly
-/// `gp_camera_capture(GP_CAPTURE_IMAGE)` underneath) does fire reliably.
-/// An apparent "first capture worked" on the Immediate path was almost
-/// certainly a stale CR2 in libgphoto2's queue from a previous session, not
-/// a fresh exposure.
+/// `gp_camera_capture(GP_CAPTURE_IMAGE)` underneath) fires reliably. A file
+/// that does turn up after an Immediate write is most likely a stale CR2 left
+/// in libgphoto2's queue by a previous session, not a fresh exposure.
 ///
-/// **Known body-firmware behaviors with this path:**
-///   - The body re-AFs on capture unless the LENS is in MF mode. Our
-///     focusmode widget writes silently no-op for AF suppression, the
-///     7D firmware ignores the hint and drives a fresh AF pass via its
-///     internal Press-Full lifecycle. The lens-switch workaround is the
+/// Known body-firmware behaviors with this path:
+///   - The body re-AFs on capture unless the lens is in MF mode. A
+///     focusmode widget write does nothing to suppress AF: the 7D firmware
+///     ignores it and drives a fresh AF pass through its internal Press-Full
+///     lifecycle, so this path writes no focusmode. The lens switch is the
 ///     reliable answer for film scanning (focus is locked by the carrier
 ///     anyway).
 ///   - The body re-meters in Av/P modes at shutter trigger. There is no
 ///     widget for AE-lock on this body (verified via `gphoto2 --get-config
-///     aelock` → empty). M mode is the only way to make the captured
-///     exposure exactly match LV preview.
-///   - `gp_camera_capture` hangs when EVF (viewfinder=1) is active, the
-///     7D's libgphoto2 driver can't service a capture op with the mirror
-///     up. Caller (AppModel.captureNow) drops EVF first via lv.stop, runs
-///     this, then restarts LV.
+///     aelock` → empty).
+///   - `gp_camera_capture` has hung on the 7D with EVF (viewfinder=1)
+///     active. The app (AppModel.captureNow) keeps live view up through
+///     the capture, so the body's live-view meter sets the exposure, and
+///     only pauses the frame fetch (`withLVPriority`).
 @CameraActor
 public final class CameraCapture {
     public struct CaptureResult: Sendable {
         /// Primary saved file. When the capture produced multiple files
-        /// (RAW+JPEG), this is the RAW; otherwise the only file.
+        /// (RAW+JPEG), this is the RAW, otherwise the first file saved.
         public let path: URL
         /// Every file this capture saved, primary included. One entry for
         /// RAW-only or JPEG-only quality settings, two for RAW+JPEG.
@@ -52,8 +49,8 @@ public final class CameraCapture {
         public let iso: String?
         public let shutter: String?
         public let aperture: String?
-        /// Metadata sidecar written next to the RAW, if any (nil when no
-        /// camera/film was set, or the backend embeds instead of sidecar-ing).
+        /// Where the metadata went: the .xmp sidecar, or the RAW itself when
+        /// the embedded backend wrote into it. nil when nothing was written.
         public let sidecarPath: URL?
     }
 
@@ -86,22 +83,31 @@ public final class CameraCapture {
         // gp_camera_capture then uses the locked AE instead of re-metering at
         // shutter trigger, which addresses the "captured image is brighter than
         // LV" symptom. Release Half clears the lock afterward. Both writes are
-        // best-effort; if the body rejects them we still try the capture.
+        // best-effort. If the body rejects them the capture still runs.
         //
-        // If users have NOT set C.Fn IV-1 to option 1, Press Half here will
-        // try to drive AF; this reverts to "re-meter on capture" instead of
-        // causing harm.
+        // If C.Fn IV-1 is not set to option 1, the capture falls back to
+        // re-metering at shutter trigger, and Press Half may drive AF (see
+        // AFProbe.swift). That is not proven harmless: an AF during live-view
+        // startup correlates with a firmware-deep wedge (see LiveView.start).
+        //
+        // gp_camera_capture half-presses with AF enabled before it fires
+        // (libgphoto2 2.5.34 library.c, RemoteReleaseOn(1, 0)). On the 7D in
+        // live view that does not move the lens: three captures from a
+        // defocused lens left the frame's sharpness unchanged, with no drive
+        // event, while DoAf from the same states focused.
         try? await properties.setString("eosremoterelease", value: "Press Half")
-        // 50ms dwell (was 150ms). The body needs ONE meter pass before
-        // capture; 50ms is empirically enough on the 7D's PTP daemon.
+        // 50ms dwell. The body needs one meter pass before capture, and
+        // 50ms is empirically enough on the 7D's PTP daemon. The three
+        // exposure reads above can run on the camera thread during this
+        // sleep, so the gap before the capture may be longer.
         try? await Task.sleep(nanoseconds: 50_000_000)
 
         // gp_camera_capture(GP_CAPTURE_IMAGE), the standard Canon capture
         // lifecycle. Returns a CameraFilePath pointing at the file the
         // body just wrote. First call after a fresh session sometimes
-        // returns -1 ("Could not capture") while the body initializes;
-        // one retry with a short delay handles that warm-up case.
-        CameraLog.capture.info("gp_camera_capture(GP_CAPTURE_IMAGE) (with AE locked via Press Half) …")
+        // returns -1 ("Could not capture") while the body initializes.
+        // Any failure gets one retry after 500 ms, which covers that case.
+        CameraLog.capture.info("gp_camera_capture(GP_CAPTURE_IMAGE) after Press Half …")
         var filePath = CameraFilePath()
         var rc = gp_camera_capture(cam, GP_CAPTURE_IMAGE, &filePath, ctx)
         if rc != GP_OK {
@@ -122,11 +128,11 @@ public final class CameraCapture {
         }
         CameraLog.capture.info("camera file: \(folderString, privacy: .public)/\(nameString, privacy: .public)")
 
-        // RAW+JPEG: the body created a second file for this shot; only the
+        // RAW+JPEG: the body created a second file for this shot. Only the
         // first came back in filePath. The companion is announced via a queued
         // FILE_ADDED event, so drain the queue briefly before naming/saving.
-        // Two consecutive 200ms timeouts = queue is empty, stop waiting (a
-        // RAW-only or JPEG-only capture pays at most ~400ms here).
+        // Two 200 ms timeouts in a row end the wait. Any other event resets
+        // that count, so the wait can run to about 2 s.
         var cameraFiles: [(folder: String, name: String)] = [(folderString, nameString)]
         var consecutiveTimeouts = 0
         let drainDeadline = Date().addingTimeInterval(2.0)
@@ -150,26 +156,29 @@ public final class CameraCapture {
         let timestamp = Date()
         try FileManager.default.createDirectory(at: destinationDir, withIntermediateDirectories: true)
 
-        // Name every file of this capture from the SAME resolved base; each
-        // gets its own true extension straight from the camera's filename.
-        var savedURLs: [URL] = []
-        for (folder, name) in cameraFiles {
-            let cameraExt = (name as NSString).pathExtension
-            var resolvedName = Self.resolveFilename(
-                pattern: filenamePattern, timestamp: timestamp, sequence: sessionSeq,
-                cameraExtension: cameraExt.isEmpty ? nil : cameraExt
-            )
-            // Same-extension collision within one capture (shouldn't happen,
-            // but a body could emit two JPEGs): disambiguate, never overwrite.
-            if savedURLs.contains(where: { $0.lastPathComponent == resolvedName }) {
-                let ns = resolvedName as NSString
-                let ext = ns.pathExtension
-                resolvedName = ns.deletingPathExtension + "_2" + (ext.isEmpty ? "" : ".\(ext)")
+        // Name every file of this capture from the same resolved base, chosen
+        // so that no file or sidecar already in the folder is replaced. Each
+        // file gets its own true extension straight from the camera's filename.
+        let resolved = Self.captureNames(
+            pattern: filenamePattern, timestamp: timestamp, startingSequence: sessionSeq,
+            cameraExtensions: cameraFiles.map { file in
+                let ext = (file.name as NSString).pathExtension
+                return ext.isEmpty ? nil : ext
+            },
+            exists: { name in
+                FileManager.default.fileExists(atPath: destinationDir.appendingPathComponent(name).path)
             }
+        )
+        if resolved.sequence != sessionSeq {
+            CameraLog.capture.info("shot number \(self.sessionSeq, privacy: .public) is taken in the folder, using \(resolved.sequence, privacy: .public)")
+        }
+        sessionSeq = resolved.sequence
+        var savedURLs: [URL] = []
+        for ((folder, name), resolvedName) in zip(cameraFiles, resolved.names) {
             let outURL = destinationDir.appendingPathComponent(resolvedName)
             let data = try downloadFile(camera: cam, context: ctx, folder: folder, name: name)
             try data.write(to: outURL, options: .atomic)
-            CameraLog.capture.info("wrote \(data.count, privacy: .public) bytes → \(outURL.path, privacy: .public)")
+            CameraLog.capture.info("wrote \(data.count, privacy: .public) bytes → \(LogExportPlan.name(of: outURL), privacy: .public)")
             savedURLs.append(outURL)
 
             // Delete the on-camera copy so the next capture has a clean slate.
@@ -187,20 +196,19 @@ public final class CameraCapture {
         let shutter = await shutterTask
         let aperture = await apertureTask
 
-        // Primary = the RAW when the capture produced a RAW+JPEG pair.
         let rawExtensions: Set<String> = ["cr2", "cr3", "crw"]
         let primary = savedURLs.first(where: { rawExtensions.contains($0.pathExtension.lowercased()) })
             ?? savedURLs[0]
 
-        // Write the camera/film provenance for the PRIMARY file (the RAW).
+        // Write the camera/film provenance for the primary file.
         // Best-effort: a metadata failure must never lose the scan, which is
-        // the irreplaceable artifact already on disk untouched.
+        // already on disk.
         var sidecarPath: URL? = nil
         if !metadata.isEmpty {
             do {
                 sidecarPath = try MetadataWriter.write(metadata, forRAW: primary)
                 if let sidecarPath {
-                    CameraLog.capture.info("wrote metadata → \(sidecarPath.path, privacy: .public)")
+                    CameraLog.capture.info("wrote metadata → \(LogExportPlan.name(of: sidecarPath), privacy: .public)")
                 }
             } catch {
                 CameraLog.capture.error("metadata write failed (scan is fine): \(String(describing: error), privacy: .public)")
@@ -256,14 +264,13 @@ public final class CameraCapture {
     /// `nonisolated` so the Settings preview can call it directly (it's a pure
     /// function).
     ///
-    /// `cameraExtension` is the extension of the file the camera actually
-    /// produced (e.g. "CR2", "CR3", "JPG"). When provided, it fills `{ext}`
-    /// AND overrides any literal extension in the pattern; the saved name must
-    /// never lie about the bytes inside (a pattern hardcoding ".CR2" used to
-    /// mislabel R5 CR3/JPEG files). Saved extensions are always uppercase,
-    /// regardless of the case the camera or the pattern used. When nil (tests,
-    /// Settings preview), tokens resolve but the pattern's literal extension
-    /// is left alone.
+    /// `cameraExtension` is the extension of the file the camera produced
+    /// (e.g. "CR2", "CR3", "JPG"). When provided, it fills `{ext}` and
+    /// overrides any literal extension in the pattern. The saved name must
+    /// never lie about the bytes inside (a pattern hardcoding ".CR2" would
+    /// otherwise mislabel CR3 or JPEG files). That extension is uppercased,
+    /// whatever case the camera or the pattern used. When nil, tokens resolve
+    /// but `{ext}` and the pattern's literal extension are left alone.
     public nonisolated static func resolveFilename(
         pattern: String, timestamp: Date, sequence: Int, cameraExtension: String? = nil
     ) -> String {
@@ -281,8 +288,8 @@ public final class CameraCapture {
             resolved = resolved.replacingOccurrences(of: "{ext}", with: ext)
         }
         var name = sanitizeFilename(resolved)
-        // Force the true extension when we know it. Patterns from older
-        // installs end in a literal ".CR2"; swap it rather than trusting it.
+        // Force the true extension when it is known. A pattern can end in a
+        // literal ".CR2", so swap it rather than trusting it.
         // Exact comparison (not case-insensitive) so a lowercase ".cr3" in a
         // pattern is also normalized to the uppercase form.
         if let ext = cameraExtension, !ext.isEmpty {
@@ -294,18 +301,93 @@ public final class CameraCapture {
         return name
     }
 
+    /// The names one capture's files are saved under, and the shot number they
+    /// carry.
+    public struct CaptureNames: Equatable, Sendable {
+        /// One name per file, in the order of the extensions passed in.
+        public let names: [String]
+        /// The shot number the names were resolved with. The next capture
+        /// counts on from here.
+        public let sequence: Int
+    }
+
+    /// Name every file of one capture so that none of them replaces a file
+    /// already in the capture folder. Pure, so the tests drive it with a set of
+    /// names instead of a folder.
+    ///
+    /// A capture's files are judged together: a name is taken when any file of
+    /// the capture would land on an existing file, or when the `<basename>.xmp`
+    /// sidecar for any of them already exists, so a new RAW never adopts an old
+    /// frame's sidecar. When the pattern numbers its names with `{seq}`, the
+    /// shot number counts up from `startingSequence` to the first one that is
+    /// free for every file. Without `{seq}`, every file of the capture gets the
+    /// same `_2`, `_3` and so on after its base name.
+    ///
+    /// - Parameters:
+    ///   - cameraExtensions: one entry per file of the capture, the extension
+    ///     of the camera's own filename, or nil when it had none.
+    ///   - exists: whether a file of that name is already in the folder.
+    public nonisolated static func captureNames(
+        pattern: String, timestamp: Date, startingSequence: Int,
+        cameraExtensions: [String?], exists: (String) -> Bool
+    ) -> CaptureNames {
+        func names(sequence: Int, suffix: Int) -> [String] {
+            var out: [String] = []
+            for ext in cameraExtensions {
+                var name = resolveFilename(pattern: pattern, timestamp: timestamp,
+                                           sequence: sequence, cameraExtension: ext)
+                if suffix > 1 { name = suffixed(name, suffix) }
+                // Two files of one capture with the same extension (a body
+                // could emit two JPEGs) must not replace each other either.
+                let first = name
+                var n = 2
+                while out.contains(name) {
+                    name = suffixed(first, n)
+                    n += 1
+                }
+                out.append(name)
+            }
+            return out
+        }
+        func taken(_ names: [String]) -> Bool {
+            names.contains { name in
+                exists(name) || exists(MetadataWriter.sidecarURL(forRAW: URL(fileURLWithPath: name)).lastPathComponent)
+            }
+        }
+
+        // `{seq}` numbers the names only if it survives into the final name. A
+        // `{seq}` in a directory part is dropped by `sanitizeFilename`, and
+        // counting up would then never reach a free name.
+        let numbered = resolveFilename(pattern: pattern, timestamp: timestamp, sequence: 1)
+            != resolveFilename(pattern: pattern, timestamp: timestamp, sequence: 2)
+        if numbered {
+            var sequence = startingSequence
+            while taken(names(sequence: sequence, suffix: 1)) { sequence += 1 }
+            return CaptureNames(names: names(sequence: sequence, suffix: 1), sequence: sequence)
+        }
+        var suffix = 1
+        while taken(names(sequence: startingSequence, suffix: suffix)) { suffix += 1 }
+        return CaptureNames(names: names(sequence: startingSequence, suffix: suffix),
+                            sequence: startingSequence)
+    }
+
+    /// `name` with `_<n>` after its base name, before the extension.
+    nonisolated static func suffixed(_ name: String, _ n: Int) -> String {
+        let ns = name as NSString
+        let ext = ns.pathExtension
+        return ns.deletingPathExtension + "_\(n)" + (ext.isEmpty ? "" : ".\(ext)")
+    }
+
     /// Reduce a resolved name to a single safe path component so a user-set
     /// pattern can never write outside the chosen capture folder. Strips any
     /// directory parts (keeps the final segment), neutralizes path separators
-    /// and parent-dir traversal, and never yields a hidden/empty name. If you
-    /// ever want pattern-driven subfolders, add that as an explicit, validated
-    /// feature rather than relaxing this.
+    /// and parent-dir traversal, and never yields a hidden/empty name.
     nonisolated static func sanitizeFilename(_ name: String) -> String {
         var s = (name as NSString).lastPathComponent
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
         while s.hasPrefix(".") { s.removeFirst() }
-        if s.isEmpty || s == ".." { s = "IMG" }
+        if s.isEmpty { s = "IMG" }
         return s
     }
 }

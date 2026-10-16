@@ -1,0 +1,27 @@
+<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="FilmTether">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:AnalogExif="http://analogexif.sourceforge.net/ns"
+    xmlns:FilmTether="https://github.com/chriscantey/film-tether/ns/1.0/"
+      tiff:Make="Leica"
+      tiff:Model="Leica M6"
+      AnalogExif:Film="Kodak Portra 400"
+      AnalogExif:FilmMaker="Kodak"
+      FilmTether:BaseSampleR="0.5431"
+      FilmTether:BaseSampleG="0.3722"
+      FilmTether:BaseSampleB="0.1903"
+      FilmTether:CropX="0.071234"
+      FilmTether:CropY="0.088765"
+      FilmTether:CropW="0.851111"
+      FilmTether:CropH="0.827222"
+      FilmTether:CropStraightenDeg="0.350"
+      FilmTether:CropFilmSizeID="3">
+   <dc:subject><rdf:Bag><rdf:li>Film: Kodak Portra 400</rdf:li></rdf:Bag></dc:subject>
+   <dc:description><rdf:Alt><rdf:li xml:lang="x-default">Leica M6 - Kodak Portra 400</rdf:li></rdf:Alt></dc:description>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>

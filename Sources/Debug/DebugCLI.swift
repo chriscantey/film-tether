@@ -5,11 +5,11 @@ import CoreGraphics
 import ImageIO
 import Scan
 
-/// FilmTetherDebug, headless CLI for exercising the Camera module without the
-/// SwiftUI app. Critical for autonomous testing over SSH: the GUI app needs a
-/// window server; this doesn't. Builds via `swift build --product FilmTetherDebug`.
+/// FilmTetherDebug is a headless CLI for exercising the Camera module without
+/// the SwiftUI app. Useful for testing over SSH: the GUI app needs a window
+/// server and this doesn't. Builds via `swift build --product FilmTetherDebug`.
 ///
-/// **Only one process can hold the USB at a time.** Quit the SwiftUI app
+/// Only one process can hold the USB at a time. Quit the SwiftUI app
 /// before running CLI commands and vice versa. If a command hangs or returns
 /// -10/-53, run `killall ptpcamerad PTPCamera` and retry.
 @main
@@ -55,22 +55,61 @@ struct DebugCLI {
             var tagArgs = rest
             let embed = tagArgs.contains("--embed")
             tagArgs.removeAll { $0 == "--embed" }
-            guard let path = tagArgs.first else { fail("tag needs FILE [CAMERA] [FILM] [--embed]") }
+            // --crop x,y,w,h[,straightenDeg[,filmSizeID]] and --sample r,g,b put a
+            // crop and an eyedropper sample into the tagged fixture's treatment
+            // record.
+            var crop: TreatmentRecord.Crop? = nil
+            var sample: TreatmentRecord.RGB? = nil
+            if let i = tagArgs.firstIndex(of: "--crop"), i + 1 < tagArgs.count {
+                let v = tagArgs[i + 1].split(separator: ",").compactMap { Double($0) }
+                guard v.count >= 4 else { fail("--crop needs x,y,w,h[,deg[,id]]") }
+                crop = TreatmentRecord.Crop(x: v[0], y: v[1], width: v[2], height: v[3],
+                                            straightenDegrees: v.count > 4 ? v[4] : 0,
+                                            filmSizeID: v.count > 5 ? Int(v[5]) : nil)
+                tagArgs.removeSubrange(i...(i + 1))
+            }
+            if let i = tagArgs.firstIndex(of: "--sample"), i + 1 < tagArgs.count {
+                let v = tagArgs[i + 1].split(separator: ",").compactMap { Double($0) }
+                guard v.count == 3 else { fail("--sample needs r,g,b") }
+                sample = TreatmentRecord.RGB(r: v[0], g: v[1], b: v[2])
+                tagArgs.removeSubrange(i...(i + 1))
+            }
+            // The shared geometry and the eyedropper point, which Film Positive
+            // reads from a Tether-written file.
+            var rotate = 0
+            if let i = tagArgs.firstIndex(of: "--rotate"), i + 1 < tagArgs.count {
+                guard let r = Int(tagArgs[i + 1]), [0, 90, 180, 270].contains(r) else { fail("--rotate needs 0, 90, 180 or 270") }
+                rotate = r
+                tagArgs.removeSubrange(i...(i + 1))
+            }
+            let flip = tagArgs.contains("--flip")
+            tagArgs.removeAll { $0 == "--flip" }
+            var straighten = 0.0
+            if let i = tagArgs.firstIndex(of: "--straighten"), i + 1 < tagArgs.count {
+                guard let d = Double(tagArgs[i + 1]) else { fail("--straighten needs degrees") }
+                straighten = d
+                tagArgs.removeSubrange(i...(i + 1))
+            }
+            var point: TreatmentRecord.Point? = nil
+            if let i = tagArgs.firstIndex(of: "--point"), i + 1 < tagArgs.count {
+                let v = tagArgs[i + 1].split(separator: ",").compactMap { Double($0) }
+                guard v.count == 2 else { fail("--point needs x,y") }
+                point = TreatmentRecord.Point(x: v[0], y: v[1])
+                tagArgs.removeSubrange(i...(i + 1))
+            }
+            guard let path = tagArgs.first else { fail("tag needs FILE [CAMERA] [FILM] [--embed] [--crop x,y,w,h[,deg[,id]]] [--sample r,g,b] [--rotate 0|90|180|270] [--flip] [--point x,y] [--straighten deg]") }
             let camera = tagArgs.count > 1 ? tagArgs[1] : ""
             let film = tagArgs.count > 2 ? tagArgs[2] : ""
             if embed { MetadataWriter.backend = .embedded }
-            runTag(file: path, camera: camera, film: film)
+            let record = TreatmentRecord(baseSample: sample, crop: crop, rotate: rotate,
+                                         flip: flip, samplePoint: point, straightenDegrees: straighten)
+            let treatment = record.isEmpty ? nil : record
+            runTag(file: path, camera: camera, film: film, treatment: treatment)
         case "lv-start":      try await runLVStart()
         case "lv-stop":       try await runLVStop()
         case "preview":
             let dir = rest.first ?? "/tmp"
             try await runPreview(toDir: dir)
-        case "zoomtest":
-            let dir = rest.first ?? "/tmp"
-            try await runZoomTest(toDir: dir)
-        case "zoomcal":
-            let dir = rest.first ?? "/tmp"
-            try await runZoomCal(toDir: dir)
         case "mf":
             guard let step = rest.first else { fail("mf needs STEP") }
             try await runManualFocus(step)
@@ -85,7 +124,8 @@ struct DebugCLI {
         case "sync-clock-utc": try await runSyncClock(local: false)
         case "test":          try await runTestSuite()
         case "help", "-h", "--help": printUsage()
-        default:              fail("unknown command: \(cmd)")
+        default:
+            fail("unknown command: \(cmd)")
         }
     }
 
@@ -134,8 +174,8 @@ struct DebugCLI {
     }
 
     /// Dump a RADIO/MENU widget's full choice list plus its current value.
-    /// Diagnostic for "why is X missing from a picker": the app's menus show
-    /// exactly these strings, so this reveals what libgphoto2/the body report.
+    /// Diagnostic for "why is X missing from a picker": these are the raw
+    /// strings libgphoto2 and the body report, before the app relabels them.
     @CameraActor
     static func runChoices(_ name: String) async throws {
         let sess = try await openSession(); defer { sess.close() }
@@ -155,7 +195,7 @@ struct DebugCLI {
         let sess = try await openSession(); defer { sess.close() }
         let props = CameraProperties(session: sess)
         let cap = CameraCapture(session: sess, properties: props)
-        let meta = CaptureMetadata(camera: camera, film: film)
+        let meta = CaptureMetadata(camera: camera, film: film, capturedAt: Date())
         let before = Date()
         let result = try await cap.capture(to: dir, metadata: meta)
         let dt = Date().timeIntervalSince(before)
@@ -163,19 +203,26 @@ struct DebugCLI {
         print("OK capture=\(result.path.path) iso=\(result.iso ?? "?") Tv=\(result.shutter ?? "?") Av=\(result.aperture ?? "?") elapsed=\(String(format: "%.1f", dt))s\(sidecar)")
     }
 
-    /// Write a metadata sidecar for an EXISTING raw, no camera needed. Use this
-    /// to generate a tagged `.xmp` next to a test CR2, convert it in FilmLab with
-    /// "Include metadata" checked, then `exiftool` the export to confirm the
-    /// camera/film survived. Decides sidecar-vs-embed for the pipeline.
-    nonisolated static func runTag(file path: String, camera: String, film: String) {
+    /// Write metadata for an existing raw, no camera needed: a sidecar by
+    /// default, or embedded in the file with `--embed`. Use this
+    /// to generate a tagged `.xmp` next to a test CR2, convert it with metadata
+    /// included, then `exiftool` the export to confirm the camera/film survived.
+    nonisolated static func runTag(file path: String, camera: String, film: String,
+                                   treatment: TreatmentRecord? = nil) {
         let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
-        let meta = CaptureMetadata(camera: camera, film: film)
-        guard !meta.isEmpty else { fail("tag needs at least a CAMERA or FILM value") }
+        let meta = CaptureMetadata(camera: camera, film: film, treatment: treatment)
+        guard !meta.isEmpty else { fail("tag has nothing to write. Give a CAMERA or FILM value, or a flag such as --crop or --rotate") }
         do {
             if let out = try MetadataWriter.write(meta, forRAW: url) {
                 print("OK wrote \(out.path)")
-                print("--- XMP ---")
-                print(meta.xmpPacket() ?? "")
+                if out.pathExtension.lowercased() == "xmp" {
+                    // Read back what is on disk: after a merge into an existing
+                    // sidecar that is the only packet that reflects the file.
+                    print("--- XMP ---")
+                    print(try String(contentsOf: out, encoding: .utf8))
+                } else {
+                    print("(embedded into \(out.lastPathComponent))")
+                }
             } else {
                 print("no-op (nothing to write)")
             }
@@ -201,12 +248,11 @@ struct DebugCLI {
         let props = CameraProperties(session: sess)
         try? await props.setString("viewfinder", value: "0")
         try? await props.setString("output", value: "TFT")
-        print("OK live view stopped (mirror down)")
+        print("OK sent viewfinder=0 and output=TFT, write errors ignored (mirror should be down)")
     }
 
-    /// Save one live-view JPEG to disk and print its dimensions. The
-    /// dimension readback is the ground truth for "what resolution does the
-    /// 7D actually stream", and the saved frame lets us eyeball the crop.
+    /// Save one live-view JPEG to disk and print its dimensions, which are the
+    /// resolution the body streams.
     @CameraActor
     static func runPreview(toDir dirString: String) async throws {
         let dir = URL(fileURLWithPath: NSString(string: dirString).expandingTildeInPath)
@@ -222,110 +268,6 @@ struct DebugCLI {
         try data.write(to: url)
         let (w, h) = LiveView.parseJPEGDimensions(data)
         print("OK preview \(w ?? 0)x\(h ?? 0) \(data.count) bytes → \(url.path)")
-    }
-
-    /// The headline verification for the camera-side zoom path: capture a
-    /// baseline (fit) frame and a 5× sensor-zoom frame, save both, and report
-    /// whether the body actually punched in (center-pixel difference). Big
-    /// difference = camera-side sensor zoom is live and sharp; ~0 = the body
-    /// silently ignored eoszoom (client-crop fallback stays in the app).
-    @CameraActor
-    static func runZoomTest(toDir dirString: String) async throws {
-        let dir = URL(fileURLWithPath: NSString(string: dirString).expandingTildeInPath)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let sess = try await openSession(); defer { sess.close() }
-        let props = CameraProperties(session: sess)
-        let lv = LiveView(session: sess, properties: props)
-        let lz = LiveZoom(session: sess)
-        try await lv.start()
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
-
-        // Baseline (fit)
-        try? await lz.setZoom(.fit)
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        let base = try await lv.fetchOnePreview()
-        let (bw, bh) = LiveView.parseJPEGDimensions(base)
-        try base.write(to: dir.appendingPathComponent("fs-base.jpg"))
-        print("baseline: \(bw ?? 0)x\(bh ?? 0)  \(base.count) bytes")
-
-        // Widget introspection, what does eoszoom/eoszoomposition look like now?
-        let zoomVal = (try? await props.getString("eoszoom")) ?? "?"
-        let posVal = (try? await props.getString("eoszoomposition")) ?? "?"
-        print("eoszoom=\(zoomVal)  eoszoomposition=\(posVal)")
-
-        // 5× sensor punch-in
-        try await lz.setZoom(.fivex)
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        let z5 = try await lv.fetchOnePreview()
-        let (zw, zh) = LiveView.parseJPEGDimensions(z5)
-        try z5.write(to: dir.appendingPathComponent("fs-zoom5.jpg"))
-        print("zoom5x:   \(zw ?? 0)x\(zh ?? 0)  \(z5.count) bytes")
-
-        // Verdict
-        let diff = LiveZoom.meanCenterPixelDifference(baseline: base, zoomed: z5)
-        let verdict = diff > 8.0
-            ? "SENSOR ZOOM WORKS, sharp punch-in (the rebuild is good)"
-            : "NO PUNCH-IN, body ignored eoszoom; client-crop fallback stays"
-        print(String(format: "center-pixel-diff=%.1f  → %@", diff, verdict))
-
-        try? await lz.setZoom(.fit)
-        try? await lv.stop()
-        print("OK zoomtest complete → \(dir.path) (fs-base.jpg, fs-zoom5.jpg)")
-    }
-
-    /// Calibration probe for eoszoomposition. Enters 5× sensor zoom, then
-    /// punches in at five known top-left positions (corners + center) in the
-    /// 1056×704 fit-frame coordinate space, saving a frame for each. Pull the
-    /// frames and SEE where each landed → confirms whether position is honored
-    /// and what the coordinate mapping is. Order tested: zoom-first, then
-    /// position (the Canon-typical order).
-    @CameraActor
-    static func runZoomCal(toDir dirString: String) async throws {
-        let dir = URL(fileURLWithPath: NSString(string: dirString).expandingTildeInPath)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let sess = try await openSession(); defer { sess.close() }
-        let props = CameraProperties(session: sess)
-        let lv = LiveView(session: sess, properties: props)
-        let lz = LiveZoom(session: sess)
-        try await lv.start()
-        try? await Task.sleep(nanoseconds: 1_500_000_000)
-
-        // Fit reference
-        try? await lz.setZoom(.fit)
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        let fit = try await lv.fetchOnePreview()
-        try fit.write(to: dir.appendingPathComponent("cal-fit.jpg"))
-        print("cal-fit.jpg written (\(fit.count) bytes)")
-
-        // Enter 5× zoom FIRST, then move the position (Canon-typical order).
-        try await lz.setZoom(.fivex)
-        try? await Task.sleep(nanoseconds: 500_000_000)
-
-        // X-SWEEP to discover the coordinate space. Canon's Evf_ZoomPosition is
-        // in the Evf coordinate system (likely ~5184×3456), NOT the 1056×704
-        // JPEG. Sweep x across both hypotheses at a fixed small y; whichever
-        // value range moves the zoom from left→right edge reveals the true
-        // space. y kept low so horizontal motion is unambiguous.
-        let yFixed = 200
-        let xs = [0, 1500, 3000, 4500, 6000, 7500, 9000, 10000]
-        var prevFrame: Data? = nil
-        for x in xs {
-            do { try await lz.setZoomPosition(x: x, y: yFixed) }
-            catch { print("  setZoomPosition(\(x),\(yFixed)) threw: \(error)") }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            let frame = try await lv.fetchOnePreview()
-            // Consecutive-frame center diff: large while the zoom is moving,
-            // ~0 once it clamps at the edge. That clamp x = right edge.
-            let diff = prevFrame.map { LiveZoom.meanCenterPixelDifference(baseline: $0, zoomed: frame) } ?? -1
-            prevFrame = frame
-            let label = String(format: "x%05d", x)
-            try frame.write(to: dir.appendingPathComponent("cal-\(label).jpg"))
-            print("cal-\(label).jpg  set=(\(x),\(yFixed))  diff_from_prev=\(String(format: "%.1f", diff))  \(frame.count) bytes")
-        }
-
-        try? await lz.setZoom(.fit)
-        try? await lv.stop()
-        print("OK zoomcal complete → \(dir.path)")
     }
 
     @CameraActor
@@ -526,7 +468,7 @@ struct DebugCLI {
             let props = CameraProperties(session: sess)
             try? await props.setString("viewfinder", value: "0")
             try? await props.setString("output", value: "TFT")
-            return "viewfinder=0 + output=TFT written (mirror should be down)"
+            return "viewfinder=0 + output=TFT sent, write errors ignored (mirror should be down)"
         })
 
         printResults(results)
@@ -549,16 +491,16 @@ struct DebugCLI {
         var pass = 0, fail = 0
         for (name, ok, evidence) in results {
             let tag = ok ? "PASS" : "FAIL"
-            print("\(tag) \(name), \(evidence)")
+            print("\(tag) \(name): \(evidence)")
             if ok { pass += 1 } else { fail += 1 }
         }
         print("\nsummary: \(pass) passed, \(fail) failed, total \(results.count)")
         print("end=\(Date())")
     }
 
-    /// With EOS_DEBUG=1, pipe libgphoto2's internal logging straight to stderr.
-    /// The GUI app bridges to unified logging instead (CameraLog); for a
-    /// headless CLI, stderr is greppable and needs no `log show`.
+    /// With EOS_DEBUG=1, forward libgphoto2's log callback to stderr. Nothing
+    /// arrives with Homebrew's libgphoto2, which compiles the callback out (see
+    /// CameraLog). The GUI app sends libgphoto2's log to unified logging instead.
     static func installStderrGphotoLog() {
         guard ProcessInfo.processInfo.environment["EOS_DEBUG"] == "1" else { return }
         gp_log_add_func(GP_LOG_DEBUG, { _, domain, message, _ in
@@ -593,9 +535,9 @@ struct DebugCLI {
 
     static func printUsage() {
         print("""
-        FilmTetherDebug, headless CLI for the Camera module.
+        FilmTetherDebug is a headless CLI for the Camera module.
 
-        Usage: filmtether-debug <command> [args]
+        Usage: FilmTetherDebug <command> [args]
 
         Commands:
           connect                 Open + close session, print firmware
@@ -606,20 +548,23 @@ struct DebugCLI {
           capture [DIR] [CAMERA] [FILM]
                                   Fire release + download the RAW under its true extension
                                   (and the JPEG too, if quality is RAW+JPEG) + write metadata
-          tag FILE [CAMERA] [FILM] [--embed]
+                                  when CAMERA or FILM is given
+          tag FILE [CAMERA] [FILM] [--crop x,y,w,h[,deg[,id]]] [--straighten deg] [--rotate 0|90|180|270] [--flip]
+                                  [--point x,y] [--sample r,g,b] [--embed]
                                   Write metadata for an EXISTING raw (no camera)
           lv-start                Engage live view briefly (sanity check)
           lv-stop                 Disengage live view (mirror down)
           preview [DIR]           Save one LV JPEG (default /tmp) + print its dimensions
-          zoomtest [DIR]          Baseline vs 5x sensor-zoom frames + punch-in verdict
           mf STEP                 Manual focus: near-tiny|near-small|near-large|far-tiny|far-small|far-large
           meter [SECONDS]         LV + drain shutterspeed events (default 8s)
           events [SECONDS]        LV + dump ALL events (default 5s)
           clock                   Read camera clock + host drift
           sync-clock              Sync camera to host LOCAL wall clock
-          sync-clock-utc          Sync camera to host UTC (legacy)
-          test                    Run full automated test suite
+          sync-clock-utc          Sync camera to host UTC (syncdatetimeutc, no local-time correction)
+          test                    Hardware checks: sets the camera clock, captures one RAW, moves focus
 
+        """)
+        print("""
         Reminder: only one process can hold the USB at a time. Quit the
         SwiftUI Film Tether app before running CLI commands. If a command
         hangs or returns -10/-53, run: killall ptpcamerad PTPCamera

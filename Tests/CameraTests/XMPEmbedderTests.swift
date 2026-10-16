@@ -1,14 +1,11 @@
 import XCTest
 @testable import Camera
 
-/// Unit tests for the append-only XMP splicer against synthetic little-endian
-/// TIFFs. The integration proof against a real CR2 (sensor-strip hashes,
-/// LibRaw decode parity, exiftool read-back) runs in scripts/verify-embed.sh,
-/// these tests prove the splice mechanics and the diff-audit guarantees.
+/// The append-only XMP splicer.
 final class XMPEmbedderTests: XCTestCase {
 
     /// Build a minimal valid little-endian TIFF:
-    /// header → IFD0 (ImageWidth=256 [tag 256], StripOffsets-ish blob pointer
+    /// header → IFD0 (ImageWidth=256 [tag 256], StripOffsets blob pointer
     /// [tag 273]) → payload blob. Returns (data, payloadRange).
     private func makeTIFF(withXMP existing: Data? = nil) -> (Data, Range<Int>) {
         var d = Data()
@@ -70,7 +67,7 @@ final class XMPEmbedderTests: XCTestCase {
         let out = try XMPEmbedder.embed(packet: newPacket, into: tiff)
         XCTAssertEqual(try readBackXMP(out), newPacket.data(using: .utf8))
         XCTAssertEqual(out.subdata(in: payloadRange), tiff.subdata(in: payloadRange))
-        // Existing-tag path: only that entry's count+offset (8 bytes) patched.
+        // Existing-tag path: at most 8 bytes patched, none in the header.
         let changed = (0..<tiff.count).filter { out[$0] != tiff[$0] }
         XCTAssertLessThanOrEqual(changed.count, 8)
         XCTAssertTrue(changed.allSatisfy { $0 >= 8 }, "header must be untouched: \(changed)")

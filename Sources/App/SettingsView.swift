@@ -3,27 +3,34 @@ import AppKit
 import Camera
 
 struct SettingsView: View {
-    @StateObject private var settings = AppSettings.shared
+    @ObservedObject private var settings = AppSettings.shared
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        TabView {
+        TabView(selection: $settings.settingsTab) {
             captureTab()
                 .tabItem { Label("Capture", systemImage: "camera.shutter.button") }
+                .tag(AppSettings.SettingsTab.capture)
 
             liveViewTab()
                 .tabItem { Label("Live View", systemImage: "viewfinder") }
+                .tag(AppSettings.SettingsTab.liveView)
 
             cameraTab()
                 .tabItem { Label("Camera", systemImage: "camera") }
+                .tag(AppSettings.SettingsTab.camera)
 
             hotkeyTab()
                 .tabItem { Label("Hotkeys", systemImage: "keyboard") }
+                .tag(AppSettings.SettingsTab.hotkeys)
 
-            aboutTab()
-                .tabItem { Label("About", systemImage: "info.circle") }
+            // Only a build with a feed has an updater to switch.
+            if let updater = AppUpdates.updater {
+                UpdatesSettingsTab(updater: updater)
+                    .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
+                    .tag(AppSettings.SettingsTab.updates)
+            }
         }
-        .frame(width: 560, height: 460)
         .padding()
     }
 
@@ -34,7 +41,7 @@ struct SettingsView: View {
         Form {
             Section("Focus peaking") {
                 HStack {
-                    Picker("Detection mode", selection: $settings.focusPeakingMode) {
+                    Picker("Mode", selection: $settings.focusPeakingMode) {
                         ForEach(FocusPeaking.Mode.allCases, id: \.self) { mode in
                             Text(mode.displayName).tag(mode)
                         }
@@ -42,11 +49,11 @@ struct SettingsView: View {
                     Image(systemName: "info.circle")
                         .foregroundStyle(.secondary)
                         .help("""
-                            Edges: Sobel boundary detector. Lights up sharp transitions, face edges, building lines, hard outlines. General purpose; works on any subject.
+                            Edges: highlights sharp outlines, like the edge of a building or a face. Works on any subject.
 
-                            Grain (default for film scanning): high-pass filter tuned to 1-3 pixel features. Suppresses smooth gradients + large edges; only lights up fine texture. When scanning film, the grain comes into focus before larger details, when grain stops twinkling, focus is locked in.
+                            Grain, the default: picks up very fine texture, a few pixels across. Smooth areas stay dark, and strong edges still show. Made for scanning film, where the grain is the finest detail there is to focus on.
 
-                            If you don't see a difference between modes on your current scene, try Grain on a high-grain stock or push Sensitivity higher.
+                            If the two look the same on what's under the lens, try Grain on a grainier stock or raise Sensitivity.
                             """)
                 }
 
@@ -65,6 +72,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .settingsPane()
     }
 
     @ViewBuilder
@@ -99,7 +107,7 @@ struct SettingsView: View {
             }
         }
         .buttonStyle(.plain)
-        .help("Use \(color.displayName) for focus peaking highlights")
+        .help("Show focus peaking in \(color.displayName.lowercased())")
     }
 
     // MARK: - Camera
@@ -110,42 +118,45 @@ struct SettingsView: View {
             Section("Camera clock") {
                 if let cameraTime = model.snapshot.cameraDateTime {
                     HStack {
-                        Text("Camera reports")
+                        Text("Camera time, cached reading")
                         Spacer()
                         Text(Self.fullClockFormatter.string(from: cameraTime))
-                            .font(.system(.body, design: .monospaced))
+                            .font(.body.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                     let drift = cameraTime.timeIntervalSinceNow
                     let absDrift = abs(drift)
                     HStack {
-                        Text("Drift vs host")
+                        Text("That reading against this Mac's clock now")
                         Spacer()
                         Text(driftString(drift))
-                            .font(.system(.body, design: .monospaced))
+                            .font(.body.monospacedDigit())
                             .foregroundStyle(absDrift > 60 ? .red : .secondary)
                     }
                 } else {
-                    Text("No clock reading yet, connect a camera to read.")
+                    Text("Connect a camera to read its clock.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Button("Sync camera clock to host now") {
+                Button("Set camera clock to this Mac's time") {
                     Task { await model.syncCameraClockLocal() }
                 }
                 .disabled(model.snapshot.cameraDateTime == nil)
-                Toggle("Auto-sync on connect", isOn: $settings.autoSyncClockOnConnect)
+                Toggle("Set the camera clock every time a camera connects", isOn: $settings.autoSyncClockOnConnect)
             }
 
-            Section("Footer display") {
-                Toggle("Show battery indicator", isOn: $settings.showBatteryIndicator)
-                Toggle("Show last metered shutter", isOn: $settings.showMeteredShutter)
-                Text("The metered shutter value only updates sporadically on this body (LV preview is real-time but the numeric readout isn't).")
+            Section("Status bar") {
+                Toggle("Show camera battery", isOn: $settings.showBatteryIndicator)
+                Toggle("Show the last metered shutter speed", isOn: $settings.showMeteredShutter)
+                Toggle("Keep the camera clock showing", isOn: $settings.showCameraClock)
+                Toggle("Show white balance gains", isOn: $settings.showWhiteBalanceGains)
+                Toggle("Show crop corners", isOn: $settings.showCropDetail)
+                Text("Some cameras only update the metered reading after a capture or a settings change, so it can lag behind live view. The clock always shows once the camera is more than five minutes off. Right-click the status bar for the same switches.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("EXIF time zone correction") {
+            Section("Camera clock offset") {
                 HStack {
                     Text("Offset")
                     Spacer()
@@ -161,16 +172,17 @@ struct SettingsView: View {
                     Image(systemName: "info.circle")
                         .foregroundStyle(.secondary)
                         .help("""
-                            Added to host UTC before syncing the camera's internal clock. Used to dial out the drift caused by the camera's own time-zone menu setting differing from your host's time zone.
+                            Added to this Mac's time when Film Tether sets the camera clock.
 
-                            Common case: camera on PST while host is on PDT → set +60.
+                            Film Tether already adds the daylight saving hour for a camera that keeps standard time, so with the camera set to this Mac's time zone, leave this at 0.
 
-                            Long-term fix lives on the camera: Menu → Setup → Time Zone → match your zone, enable DST. Then this offset can stay at 0.
+                            Use it only when capture times still come out a whole number of hours off, for example with the camera set to another time zone: one zone east of this Mac needs -60, one zone west needs +60.
                             """)
                 }
             }
         }
         .formStyle(.grouped)
+        .settingsPane()
     }
 
     static let fullClockFormatter: DateFormatter = {
@@ -197,13 +209,12 @@ struct SettingsView: View {
             Section("Capture folder") {
                 HStack {
                     Text(settings.captureFolder.path)
-                        .font(.system(.body, design: .monospaced))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Button("Choose…") { chooseCaptureFolder() }
                 }
-                Text("Captured files land here exactly as the camera produced them, no re-encoding, with the camera's real extension (.CR2, .CR3, .JPG…). Set the camera-side image quality to RAW and you get the full sensor data; RAW+JPEG saves both files.")
+                Text("Each capture is saved here with the camera's own extension (.CR2, .CR3, .JPG). Set the camera to RAW to keep the full sensor data, or to RAW+JPEG to get both files.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -211,8 +222,8 @@ struct SettingsView: View {
             Section("Metadata") {
                 Toggle("Write metadata into the RAW file", isOn: $settings.embedMetadata)
                 Text(settings.embedMetadata
-                     ? "Camera/Film metadata is embedded inside the .CR2 itself (sensor data is never touched, and the write is verified before it replaces the file). Travels with the file forever, read by FilmLab and everything else."
-                     : "Camera/Film metadata is written to a .xmp sidecar next to the .CR2. The RAW file is never opened. Read by Lightroom, Capture One, darktable, and Film Positive.")
+                     ? "Camera and film details are written inside the RAW file. The image data is never touched, and the file is only replaced once the write checks out. The details go wherever the file goes."
+                     : "Camera and film details are written to a .xmp sidecar file next to the RAW, and the RAW itself is never written to. Keep the two files together when you move them.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -220,19 +231,20 @@ struct SettingsView: View {
             Section("Filename pattern") {
                 TextField("", text: $settings.filenamePattern)
                     .font(.system(.body, design: .monospaced))
-                Text("Tokens: {ymd} = yyyyMMdd, {hms} = HHmmss, {seq} = zero-padded session counter, {ext} = the camera file's own extension (CR2, CR3, JPG…). A literal extension in the pattern is corrected to the real one at save time.")
+                Text("Tokens: {ymd} is the date (20260919), {hms} the time (143005), {seq} this session's shot count with leading zeros, skipping numbers already used in the folder, and {ext} the camera's own extension (CR2, CR3, JPG). An extension typed into the pattern is swapped for the real one when the file is saved.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Preview: \(previewFilename())")
+                Text("Example: \(previewFilename())")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+        .settingsPane()
     }
 
-    /// Reuse the canonical resolver (incl. its path-safety sanitization) so the
-    /// preview always matches what capture actually writes.
+    /// Uses the capture's own resolver (including its path-safety
+    /// sanitization), with sequence 1 and no camera extension.
     private func previewFilename() -> String {
         CameraCapture.resolveFilename(pattern: settings.filenamePattern, timestamp: Date(), sequence: 1)
     }
@@ -244,7 +256,7 @@ struct SettingsView: View {
         panel.allowsMultipleSelection = false
         panel.directoryURL = settings.captureFolder
         panel.prompt = "Choose"
-        panel.message = "Pick a folder for captured RAW files"
+        panel.message = "Choose a folder for captures"
         if panel.runModal() == .OK, let url = panel.url {
             settings.setCaptureFolder(url)
         }
@@ -256,17 +268,17 @@ struct SettingsView: View {
     private func hotkeyTab() -> some View {
         Form {
             Section("Capture") {
-                Picker("Trigger key", selection: $settings.captureKeyCode) {
+                Picker("Capture key", selection: $settings.captureKeyCode) {
                     ForEach(KeyCodeLabel.common, id: \.code) { item in
                         Text(item.label).tag(item.code)
                     }
                 }
-                Text("Default: Space. Tap once to capture. ⌘Return also triggers from any menu.")
+                Text("Space by default. Press once to capture. Cmd-Return captures too. The capture key does nothing while you're typing in a text field.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Focus-check zoom (hold)") {
+            Section("Hold to zoom") {
                 Toggle("Hold Shift to zoom", isOn: $settings.zoomUsesShift)
                 if !settings.zoomUsesShift {
                     Picker("Hold key", selection: $settings.zoomKeyCode) {
@@ -276,15 +288,15 @@ struct SettingsView: View {
                     }
                 }
                 Text(settings.zoomUsesShift
-                     ? "Hold Shift over live view to punch in 5×, real sensor zoom, sharp enough to focus. Release to fit. Drag the box first to choose where it zooms; arrow keys nudge it while held. (Shift-zoom is always window-local.)"
-                     : "Hold the chosen key to zoom 5×, release to fit. Arrow keys nudge the zoom rectangle while held.")
+                     ? "Hold Shift over live view to see the camera's own 5× magnified view, and let go to see the whole frame again. Drag the zoom box first to choose where it looks. The arrow keys move it while you hold. Works only while Film Tether's window is in front."
+                     : "Hold the chosen key to see the 5× view, and let go to see the whole frame again. The arrow keys move the zoom box while you hold.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Global hotkey scope") {
-                Toggle("Enable global hotkey", isOn: $settings.enableGlobalHotkey)
-                Text("When ON, hotkeys fire even while another app is frontmost. Requires Accessibility + Input Monitoring permissions. When OFF, hotkeys only fire when Film Tether's window is focused.")
+            Section("Hold key in other apps") {
+                Toggle("Use the hold key while another app is in front", isOn: $settings.enableGlobalHotkey)
+                Text("Applies to the hold-to-zoom key when Hold Shift to zoom is off. Needs the Accessibility and Input Monitoring permissions. Without both, the hold key still works while Film Tether is in front. The capture, focus and autofocus keys only work while Film Tether's window is in front.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if settings.enableGlobalHotkey {
@@ -300,6 +312,12 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        // The hold-key monitor reads these when it starts, so restart it on a
+        // change rather than leaving the change to the next connect.
+        .onChange(of: settings.zoomUsesShift) { model.applyHoldKeySettings() }
+        .onChange(of: settings.zoomKeyCode) { model.applyHoldKeySettings() }
+        .onChange(of: settings.enableGlobalHotkey) { model.applyHoldKeySettings() }
+        .settingsPane()
     }
 
     @ViewBuilder
@@ -316,25 +334,17 @@ struct SettingsView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+}
 
-    // MARK: - About
-
-    @ViewBuilder
-    private func aboutTab() -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "camera.aperture")
-                .font(.system(size: 56, weight: .light))
-                .foregroundStyle(.secondary)
-            Text("Film Tether")
-                .font(.title2)
-            Text("Tethered control for compatible cameras over USB, built around libgphoto2.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Link("Supported cameras", destination: AppInfo.supportedCamerasURL)
-                .font(.caption)
-            Spacer()
-        }
-        .padding(.top, 24)
+private extension View {
+    /// Each tab is exactly as tall as its own content, so no tab scrolls. The
+    /// Metadata caption and the Hotkeys permission rows change height with
+    /// their settings, so no single fixed height fits. The grouped Form stops
+    /// scrolling and reports its content height, and the Settings window
+    /// resizes to it on each tab.
+    func settingsPane() -> some View {
+        scrollDisabled(true)
+            .frame(width: 560)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }

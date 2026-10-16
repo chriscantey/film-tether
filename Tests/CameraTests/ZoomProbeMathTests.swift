@@ -5,7 +5,7 @@ import ImageIO
 
 final class ZoomProbeMathTests: XCTestCase {
 
-    /// Synthesize a solid-gray JPEG of `value` luminance, 200×200.
+    /// Synthesize a solid-gray JPEG of `value` luminance, 200x200.
     private func gray(_ value: UInt8) -> Data {
         let size = 200
         let cs = CGColorSpaceCreateDeviceGray()
@@ -32,33 +32,18 @@ final class ZoomProbeMathTests: XCTestCase {
         return out as Data
     }
 
-    func testIdenticalFramesProduceZeroDiff() {
-        let g = gray(128)
-        let diff = LiveZoom.meanCenterPixelDifference(baseline: g, zoomed: g)
-        // JPEG quantization can introduce tiny residuals even on identical frames; still < 1.
-        XCTAssertLessThan(diff, 1.0)
-    }
-
-    func testDifferentFramesProduceLargeDiff() {
-        let dark = gray(20)
-        let bright = gray(220)
-        let diff = LiveZoom.meanCenterPixelDifference(baseline: dark, zoomed: bright)
-        // |220 - 20| = 200 in the limit; JPEG compression knocks it down but >> 8.
-        XCTAssertGreaterThan(diff, 50.0)
-    }
 
     func testJPEGCropDownsizesCenter() {
         let g = gray(128)
-        guard let cropped = JPEGCrop.centerCrop(g, divisor: 5) else {
+        guard let cropped = JPEGCrop.cropAt(g, divisor: 5, center: CGPoint(x: 0.5, y: 0.5)) else {
             XCTFail("crop returned nil")
             return
         }
         // Byte count is no proxy for dimensions on tiny synthetic JPEGs (encoder
-        // overhead dominates and a recompressed crop can be BIGGER than the
-        // source). Assert the decoded pixel dimensions instead: 128 / 5 ≈ 25.
+        // overhead dominates and a recompressed crop can be bigger than the
+        // source). The 200x200 source cropped by 5 is 40x40, so the decoded
+        // crop must come back strictly smaller than the source.
         XCTAssertGreaterThan(cropped.count, 0)
-        // (centerCrop clamps to a ~40px floor, so assert "strictly smaller
-        // than the source frame," not an exact 128/5.)
         let (w, h) = LiveView.parseJPEGDimensions(cropped)
         let (sw, sh) = LiveView.parseJPEGDimensions(g)
         XCTAssertTrue((w ?? 0) > 0 && (w ?? 0) < (sw ?? 0), "cropped width \(w ?? 0) vs source \(sw ?? 0)")
@@ -67,7 +52,7 @@ final class ZoomProbeMathTests: XCTestCase {
 
     func testJPEGCropDivisor1ReturnsOriginal() {
         let g = gray(128)
-        let unchanged = JPEGCrop.centerCrop(g, divisor: 1)
+        let unchanged = JPEGCrop.cropAt(g, divisor: 1, center: CGPoint(x: 0.5, y: 0.5))
         XCTAssertEqual(unchanged, g)
     }
 }

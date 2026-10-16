@@ -17,7 +17,7 @@ final class PreviewZoomTests: XCTestCase {
         XCTAssertTrue(PreviewZoom.fiveX.engagesCameraPunchIn)
     }
 
-    func testLabels() {
+    func testTheLabelsOfFitActualAndFiveX() {
         XCTAssertEqual(PreviewZoom.fit.label(fitPercent: 85), "Fit (85%)")
         XCTAssertEqual(PreviewZoom.actual.label(fitPercent: 85), "100%")
         XCTAssertEqual(PreviewZoom.fiveX.label(fitPercent: 85), "500%")
@@ -30,7 +30,7 @@ final class PreviewZoomTests: XCTestCase {
     }
 
     func testFitPercentUsesTheMoreConstrainingAxis() {
-        // 1056×704 frame in a pane that's wide but short: height constrains.
+        // 1056x704 frame in a pane that's wide but short: height constrains.
         let p = PreviewZoom.fitPercent(frame: CGSize(width: 1056, height: 704),
                                        pane: CGSize(width: 2000, height: 352))
         XCTAssertEqual(p, 50)
@@ -42,9 +42,8 @@ final class PreviewZoomTests: XCTestCase {
         XCTAssertEqual(p, 250)
     }
 
-    /// The rotation-recalculates-zoom requirement, expressed as arithmetic: the
-    /// same frame in the same pane fits at a different percentage once its width
-    /// and height are swapped.
+    /// Rotating the frame swaps its width and height, so the same frame in
+    /// this pane fits at a different percentage.
     func testRotatingTheFrameChangesTheFitPercentage() {
         let pane = CGSize(width: 900, height: 600)
         let landscape = PreviewZoom.fitPercent(frame: CGSize(width: 1200, height: 800), pane: pane)

@@ -1,36 +1,38 @@
 import AppKit
 
-/// Cleans up the menu bar AppKit actually ends up with.
+/// Cleans up the menu bar AppKit ends up with.
 ///
-/// SwiftUI's `commands` builder says what to *add*; the finished menu bar is
+/// SwiftUI's `commands` builder says what to add. The finished menu bar is
 /// that merged with the standard macOS menus, and the merge leaves debris no
 /// SwiftUI API can reach:
 ///
-/// - **Separators with nothing between them.** Each `CommandGroup` gets its own
+/// - Separators with nothing between them. Each `CommandGroup` gets its own
 ///   separator whether or not the group has any content, so emptied groups
 ///   collapse into doubled separators, and a group at the end of a menu leaves a
 ///   trailing one. Both draw as blank space.
-/// - **Duplicated system items.** AppKit injects "Start Dictation…" and
-///   "Emoji & Symbols" into Edit, and does it more than once, three copies of
-///   Emoji & Symbols in this app.
-/// - **Commands for features that don't exist.** "Toggle Sidebar" is added even
-///   with no sidebar to toggle, and lands in Help of all places.
-/// - **Empty menus.** A menu with no items opens and instantly closes again,
-///   and can't be reopened, it reads as a broken app rather than an empty menu.
+/// - Duplicated system items. AppKit injects "Start Dictation…" and
+///   "Emoji & Symbols" into Edit, and does it more than once (three copies of
+///   Emoji & Symbols in this app).
+/// - Commands for features that don't exist. "Toggle Sidebar" is added even
+///   with no sidebar to toggle, and lands in Help.
+/// - Empty menus. A menu with no items opens and instantly closes again,
+///   and can't be reopened, so it reads as a broken app rather than an empty
+///   menu.
 ///
 /// The tidy re-runs every time the menu bar is clicked rather than once at
-/// launch, because SwiftUI rebuilds menus whenever the state behind a title
-/// changes, several titles here are state-dependent ("Hide/Show Zoom-Area
-/// Overlay", the current rotation angle), and each rebuild brings the debris
-/// back. Re-running is cheap and self-healing.
+/// launch. SwiftUI rebuilds menus whenever the state behind a title changes,
+/// several titles here are state-dependent ("Hide/Show Zoom Box",
+/// the current rotation angle), and each rebuild brings the debris back.
+/// Re-running is cheap.
 enum MenuBarTidy {
 
     /// Actions for features this app doesn't have, whose menu items macOS adds
     /// anyway.
     ///
-    /// Only items that exist *before* a menu displays can be removed this way,
-    /// see the note on `onTidied`. Window tabbing is handled at the source
-    /// instead, for exactly that reason.
+    /// Only items that exist before a menu displays can be removed this way.
+    /// AppKit inserts some items between a menu being asked to display and
+    /// the menu closing, after every hook available here, so window tabbing is
+    /// handled at the source instead.
     private static let unwantedActions: Set<Selector> = [
         Selector(("toggleSidebar:")),
     ]
@@ -40,9 +42,9 @@ enum MenuBarTidy {
         // one camera over one USB connection, so a second tab could only ever
         // show the same thing. This has to be switched off at the source rather
         // than filtered out below, because AppKit inserts "Hide Tab Bar" and
-        // "Show All Tabs" while the menu is being displayed, after every hook
-        // this class can install. Measured: with tabbing on, they appear in View
-        // no matter what the tidy does; with it off, they never appear at all.
+        // "Show All Tabs" while the menu is being displayed (see
+        // unwantedActions). Measured: with tabbing on, they appear in View
+        // no matter what the tidy does, and with it off they never appear at all.
         // It also keeps "Merge All Windows" and the rest out of the Window menu,
         // which otherwise grows from 4 items to 16.
         NSWindow.allowsAutomaticWindowTabbing = false
@@ -50,79 +52,36 @@ enum MenuBarTidy {
         NotificationCenter.default.addObserver(
             forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main
         ) { note in
-            // Only the menu bar. This notification fires for *every* menu,
-            // each top-level menu as it opens, the toolbar's own pickers, and
-            // the system's submenus, and tidying those means touching menus we
+            // Only the menu bar. This notification fires for every menu, each
+            // top-level menu as it opens, the pickers' pop-up menus, and the
+            // system's submenus, and tidying those means touching menus we
             // don't own for no benefit.
             guard let menu = note.object as? NSMenu, menu === NSApp.mainMenu else { return }
             tidy(menu, isMenuBar: true)
-            onTidied?()
         }
-        // Also after tracking ends: anything AppKit adds between "about to
-        // display" and the menu actually closing is only observable here.
-        NotificationCenter.default.addObserver(
-            forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main
-        ) { _ in onTidied?() }
         tidy(NSApp.mainMenu, isMenuBar: true)
         // And again once SwiftUI has finished building the menu bar. The pass
-        // above runs from `applicationDidFinishLaunching`, which is too early,
-        // the menus barely exist yet, so it cleans almost nothing and the first
-        // click is left meeting an untidied menu bar. That first click is
-        // exactly when the debris is visible: measured, the app menu opened with
-        // a blank row at the bottom, and looked right on every subsequent open
-        // because by then a tracking pass had cleaned it.
+        // above runs from `applicationDidFinishLaunching`, which is too early:
+        // the menus barely exist yet, so it cleans almost nothing. These
+        // delayed passes tidy the bar before the first click. They do not
+        // remove the app menu's "Quit and Close All Windows", which renders as
+        // a blank row on the first open: AppKit inserts it when the menu
+        // displays (see unwantedActions).
         for delay in [0.5, 1.5, 3.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                populateThenTidy()
+                tidy(NSApp.mainMenu, isMenuBar: true)
             }
         }
     }
 
-    /// A tidy once SwiftUI has finished building the menu bar.
-    ///
-    /// The pass in `install()` runs from `applicationDidFinishLaunching`, which
-    /// is too early, the menus barely exist yet, so it cleans almost nothing
-    /// and the first click is left meeting an untidied menu bar.
-    ///
-    /// It does **not** fix the app menu's "Quit and Close All Windows", which is
-    /// what renders as a blank row on the first open. That item is inserted when
-    /// the menu displays, after every hook available here; logging every
-    /// alternate this class sees turned up only File's "Close All", never the
-    /// app menu's. Asking the menu to `update()` first doesn't surface it, and
-    /// marking the window non-restorable doesn't prevent it. It is left alone
-    /// rather than papered over.
-    private static func populateThenTidy() {
-        tidy(NSApp.mainMenu, isMenuBar: true)
-    }
-
-    /// Hook for the debug dump, so a report can be taken from the menu bar as it
-    /// actually stands rather than as it stands at launch.
-    ///
-    /// Finding out *when* the menu bar can be inspected truthfully took three
-    /// tries, each one disproved by leaving window tabbing deliberately enabled
-    /// and checking whether the report noticed:
-    ///
-    /// 1. At launch, after `update()` on every submenu, reported a clean View
-    ///    menu. Wrong.
-    /// 2. On the menu bar's `didBeginTracking`, still clean. Wrong.
-    /// 3. On each submenu's `didBeginTracking`, still clean. Wrong.
-    /// 4. On `didEndTracking`, "Hide Tab Bar" and "Show All Tabs" finally
-    ///    appear.
-    ///
-    /// So AppKit inserts them between a menu being asked to display and the
-    /// menu closing, which is after every hook available here. That's why
-    /// tabbing is disabled at the source, and why a report that hasn't had a
-    /// menu opened in front of it proves nothing.
-    static var onTidied: (() -> Void)?
-
     /// Tidy the menu bar's own menus, File, Edit, View and the rest, and
     /// nothing nested inside them.
     ///
-    /// **Not recursive, deliberately.** Reading `items` on a menu is what makes
-    /// the system populate it, and the Services submenu populates by asking
-    /// every application on the machine what it can do. Recursing into it cost
-    /// **16 seconds** on the first click of the app menu, measured, the app
-    /// appeared to hang. Nothing this class fixes is ever nested anyway: the
+    /// Not recursive. Reading `items` on a menu is what makes the system
+    /// populate it, and the Services submenu populates by asking every
+    /// application on the machine what it can do. Recursing into it can take
+    /// 16 seconds on the first click of the app menu, long enough that the
+    /// app appears to hang. Nothing this type fixes is ever nested anyway: the
     /// debris it removes sits at the top level of each menu, and the submenus
     /// below that belong to the system.
     static func tidy(_ menu: NSMenu?, isMenuBar: Bool = false) {
@@ -138,7 +97,7 @@ enum MenuBarTidy {
             tidy(sub)
         }
         // A top-level title whose menu has nothing in it is worse than no title
-        // at all, it opens and dismisses itself.
+        // at all, because it opens and dismisses itself.
         for item in menu.items where item.submenu?.items.isEmpty == true {
             menu.removeItem(item)
         }
@@ -151,8 +110,8 @@ enum MenuBarTidy {
     }
 
     /// Drop repeats of the same command, keeping the first. Matches on title and
-    /// action together so two genuinely different items that happen to share a
-    /// title survive.
+    /// action together so two different items that happen to share a title
+    /// survive.
     private static func removeDuplicates(_ menu: NSMenu) {
         var seen = Set<String>()
         for item in menu.items where !item.isSeparatorItem {

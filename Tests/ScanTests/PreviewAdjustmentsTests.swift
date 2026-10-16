@@ -11,10 +11,9 @@ final class ChannelGainsTests: XCTestCase {
         XCTAssertTrue(g.isIdentity)
     }
 
-    /// The whole point of the feature: applying the gains to the colour they
-    /// were derived from must land on neutral grey.
-    func testGainsActuallyNeutraliseTheSampledColour() throws {
-        // Something like an orange colour-negative base.
+    /// Gains applied to the color they were derived from must land on neutral gray.
+    func testGainsNeutralizeTheSampledColor() throws {
+        // Something like an orange color-negative base.
         let (r, gr, b) = (0.90, 0.50, 0.20)
         let g = try XCTUnwrap(ChannelGains.neutralizing(red: r, green: gr, blue: b))
         let corrected = (r * g.red, gr * g.green, b * g.blue)
@@ -22,8 +21,8 @@ final class ChannelGainsTests: XCTestCase {
         XCTAssertEqual(corrected.1, corrected.2, accuracy: 1e-9)
     }
 
-    /// Correcting shouldn't double as an exposure change, the neutral result
-    /// should sit at the sample's own mean level.
+    /// Correcting shouldn't double as an exposure change. The neutral result
+    /// sits at the sample's own mean level.
     func testCorrectionPreservesTheSampledBrightness() throws {
         let (r, gr, b) = (0.90, 0.50, 0.20)
         let mean = (r + gr + b) / 3
@@ -37,14 +36,14 @@ final class ChannelGainsTests: XCTestCase {
     }
 
     /// A sample that's dark overall but has one usable channel is still worth
-    /// correcting; only an all-dark sample is hopeless.
+    /// correcting. Only an all-dark sample is hopeless.
     func testASampleWithOneBrightChannelIsAccepted() {
         XCTAssertNotNil(ChannelGains.neutralizing(red: 0.4, green: 0.001, blue: 0.001))
     }
 
     func testGainsAreClampedToTheAllowedRange() throws {
-        // green is vanishingly small next to red, which would divide out to a
-        // gain in the hundreds without clamping.
+        // green is vanishingly small next to the mean, which would divide out to
+        // a gain in the thousands without clamping.
         let g = try XCTUnwrap(ChannelGains.neutralizing(red: 0.9, green: 0.0001, blue: 0.9))
         XCTAssertLessThanOrEqual(g.green, ChannelGains.maxGain)
         XCTAssertGreaterThanOrEqual(g.red, ChannelGains.minGain)
@@ -69,8 +68,8 @@ final class ChannelGainsTests: XCTestCase {
 
 final class PreviewAdjustmentsTests: XCTestCase {
 
-    /// The 30 fps fast path: with nothing to do, the render step must be
-    /// skippable so an unadjusted preview costs no decode/encode.
+    /// The 30 fps fast path: default adjustments are the identity, so they add
+    /// no work to the preview's render step.
     func testDefaultsAreIdentity() {
         XCTAssertTrue(PreviewAdjustments.none.isIdentity)
         XCTAssertTrue(PreviewAdjustments(monochrome: false, whiteBalance: nil).isIdentity)

@@ -25,22 +25,21 @@ final class FirmwareParsingTests: XCTestCase {
         XCTAssertNil(CameraSession.parseFirmware(from: summary))
     }
 
-    func test_7D_2_0_6_isAcceptable() {
+    func test7DFirmware206IsAcceptable() {
         XCTAssertFalse(CameraSession.isFirmwareTooOld("2.0.6"))
     }
 
-    func test_7D_2_0_3_isTooOld() {
-        // Specific buggy firmware, gphoto2 issue #460.
+    func testFirmware203IsRefused() {
         XCTAssertTrue(CameraSession.isFirmwareTooOld("2.0.3"))
     }
 
-    func test_70D_typical_firmware_isAcceptable() {
-        // The 70D ships firmware in the 1.x range; should not be blocked.
+    func test70DTypicalFirmwareIsAcceptable() {
+        // The 70D ships firmware in the 1.x range, which should not be blocked.
         XCTAssertFalse(CameraSession.isFirmwareTooOld("1.1.5"))
         XCTAssertFalse(CameraSession.isFirmwareTooOld("1.0.4"))
     }
 
-    func test_other_eos_versions_arePermissive() {
+    func testOtherEOSVersionsArePermissive() {
         XCTAssertFalse(CameraSession.isFirmwareTooOld("3.0.0"))
         XCTAssertFalse(CameraSession.isFirmwareTooOld("2.0.5"))
     }

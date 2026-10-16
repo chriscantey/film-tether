@@ -1,0 +1,4 @@
+This directory is a vendored copy of film-sidecar, the Swift package (MIT, see
+LICENSE) that holds the sidecar format Film Tether shares with Film Positive.
+It ships inside this repository so the app builds from a fresh clone, and it
+is the copy Film Tether 0.4.0 is built with.

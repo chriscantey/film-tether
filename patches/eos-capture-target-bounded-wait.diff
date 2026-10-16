@@ -1,0 +1,83 @@
+libgphoto2: bound the AvailableShots wait after an EOS body's capture
+target switches to the PC
+
+After it sets the capture destination to the PC,
+camera_canon_eos_update_capture_target polls the camera until it reports
+AvailableShots above zero. An EOS 7D sometimes never does, and the loop
+then polls GetEvent forever, which hangs the first config read of a
+session. The wait is now bounded at 1 s of wall clock, after which it logs
+one line and carries on as if the value had arrived.
+
+Two environment variables are read inside the wait:
+
+- FT_RESEND_PCHDD: when set, PCHDDCapacity is sent once more, 500 ms into
+  the wait, with this value as its first parameter. Film Tether sets it at
+  launch to 0x7fffffff unless FT_NO_RESEND_PCHDD is set. Unset, there is no
+  resend.
+- FT_PTP_TRACE: when set, the time the answer took is written to stderr.
+
+Applies to libgphoto2 2.5.34.
+
+--- a/camlibs/ptp2/config.c
++++ b/camlibs/ptp2/config.c
+@@ -16,6 +16,10 @@
+  * License along with this library; if not, write to the
+  * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+  * Boston, MA  02110-1301  USA
++ *
++ * Changed for Film Tether (https://github.com/chriscantey/film-tether) on
++ * 28 September 2026: camera_canon_eos_update_capture_target bounds its wait
++ * for AvailableShots at 1 s and can resend PCHDDCapacity during that wait.
+  */
+ #define _DEFAULT_SOURCE
+ #include "config.h"
+@@ -355,11 +359,44 @@
+ 			C_PTP (ret);
+ 			/* Tricky ... eos1200d seems to take a while to register this change and the first capture
+ 			 * when it is still switching might be going down the drain. */
+-			while (1) {
+-				C_PTP (ptp_check_eos_events (params));
+-				C_PTP (ptp_canon_eos_getdevicepropdesc (params,PTP_DPC_CANON_EOS_AvailableShots, &dpd));
+-				if (dpd.CurrentValue.u32 > 0)
+-					break;
++			/* Film Tether, 28 September 2026: bounded at 1 s wall clock. An EOS 7D
++			 * sometimes never reports AvailableShots > 0 after the switch to the PC,
++			 * and without the bound this loop polls GetEvent forever (12,368 empty
++			 * events in 30 s, measured on a 7D), which hangs the first config read
++			 * of a session. After the bound it carries on as if the value had
++			 * arrived. */
++			{
++				struct timeval	shots_start = time_now();
++				unsigned int	shots_polls = 0;
++				int		shots_resent = 0;
++				while (1) {
++					C_PTP (ptp_check_eos_events (params));
++					C_PTP (ptp_canon_eos_getdevicepropdesc (params,PTP_DPC_CANON_EOS_AvailableShots, &dpd));
++					shots_polls++;
++					if (dpd.CurrentValue.u32 > 0) {
++						if (getenv ("FT_PTP_TRACE"))
++							fprintf (stderr, "ft-ptp capture target: AvailableShots=%u after %u polls in %d ms\n",
++								 dpd.CurrentValue.u32, shots_polls, time_since (shots_start));
++						break;
++					}
++					/* With FT_RESEND_PCHDD set, tell the camera about the PC's storage
++					 * once more, 500 ms into the wait. Film Tether sets it at launch
++					 * unless FT_NO_RESEND_PCHDD is set. Unset, there is no resend. */
++					if (!shots_resent && getenv ("FT_RESEND_PCHDD") && time_since (shots_start) > 500) {
++						uint16_t r2 = ptp_canon_eos_pchddcapacity (params, (uint32_t) strtoul (getenv ("FT_RESEND_PCHDD"), NULL, 0), 0x00001000, 0x00000001);
++						shots_resent = 1;
++						fprintf (stderr, "ft-ptp capture target: resent PCHDDCapacity(%s) -> 0x%04x\n", getenv ("FT_RESEND_PCHDD"), r2);
++					}
++					if (time_since (shots_start) > 1000) {
++						char shots_msg[160];
++						snprintf (shots_msg, sizeof (shots_msg),
++							  "capture target: no AvailableShots after %u polls in %d ms (last %u), carrying on",
++							  shots_polls, time_since (shots_start), dpd.CurrentValue.u32);
++						GP_LOG_E ("%s", shots_msg);
++						fprintf (stderr, "ft-ptp %s\n", shots_msg);
++						break;
++					}
++				}
+ 			}
+ 		}
+ 	} else {

@@ -5,22 +5,25 @@ import os
 import Camera
 import Hotkey
 import Scan
+import ImageIO
 
-private let appLog = Logger(subsystem: "co.wonders.filmtether", category: "AppModel")
-private let hotkeyLog = Logger(subsystem: "co.wonders.filmtether", category: "Hotkey")
+private let appLog = Logger(subsystem: LogExportPlan.subsystem, category: "AppModel")
+private let hotkeyLog = Logger(subsystem: LogExportPlan.subsystem, category: "Hotkey")
 
 /// Build identity, injected into Info.plist by scripts/bundle.sh (git short hash
-/// + build time). Surfaced in the window title so we can always confirm exactly
-/// which build is running.
+/// + build time). Surfaced in the About panel so the running build can always
+/// be confirmed exactly.
 enum AppInfo {
     static var buildStamp: String {
         (Bundle.main.infoDictionary?["BuildStamp"] as? String) ?? "dev"
     }
 
     /// Where the in-app "supported cameras" links point. The app UI stays
-    /// camera-agnostic ("compatible camera"); the authoritative tested/supported
+    /// camera-agnostic ("compatible camera"). The authoritative tested/supported
     /// list lives in the repo README.
     static let supportedCamerasURL = URL(string: "https://github.com/chriscantey/film-tether#supported-cameras")!
+    /// Help > Film Tether Help: the README is the app's write-up.
+    static let helpURL = URL(string: "https://github.com/chriscantey/film-tether#readme")!
 }
 
 @MainActor
@@ -30,7 +33,8 @@ final class AppModel: ObservableObject {
         case enumerating
         case ready
         case streaming
-        case error(message: String, hint: String?)
+        /// `detail` is the raw code and message, shown behind an info icon.
+        case error(message: String, hint: String?, detail: String? = nil)
     }
 
     struct PropertySnapshot: Equatable {
@@ -41,9 +45,8 @@ final class AppModel: ObservableObject {
         var shutter: String = "—"
         /// Last non-"Auto" shutter value observed during this session. In Av
         /// mode the body returns "Auto" most of the time and a numeric value
-        /// briefly after a metering pass, this field captures that brief
-        /// numeric value and persists it so the user always sees what the
-        /// camera most-recently decided. Updated by AppModel.refreshSnapshot.
+        /// briefly after a metering pass. This field keeps that brief numeric
+        /// value.
         var meteredShutter: String? = nil
         var aperture: String = "—"
         var whiteBalance: String = "—"
@@ -51,12 +54,19 @@ final class AppModel: ObservableObject {
         var mode: String = "—"
         var imageFormat: String = "—"
         var battery: String = "—"
-        var meteringMode: String = "—"
+        /// The body's focus mode as libgphoto2 names it. "Manual" is the lens
+        /// switch on MF, which closes the focus group. nil until read.
+        var focusMode: String? = nil
         var cameraDateTime: Date? = nil
-        var fps: Double = 0
+        /// Camera clock minus host clock, from the last fresh read, or 0 after
+        /// a successful sync. Stored as an offset rather than a timestamp
+        /// because both clocks tick in real time, and the footer reconstructs
+        /// `now + offset` every second. Nil until the camera's clock has been
+        /// read once.
+        var cameraClockOffset: TimeInterval? = nil
 
-        // Pretty-formatted display strings. Computed from raw values via
-        // PropertyLabels, UI shows these.
+        // Display strings, computed from the raw values via PropertyLabels.
+        // The UI shows these.
         var isoLabel: String { PropertyLabels.iso(iso) }
         var shutterLabel: String { PropertyLabels.shutter(shutter) }
         var apertureLabel: String { PropertyLabels.aperture(aperture) }
@@ -71,26 +81,39 @@ final class AppModel: ObservableObject {
     @Published private(set) var snapshot = PropertySnapshot()
     @Published private(set) var latestFrame: NSImage? = nil
     @Published private(set) var lastCapture: String? = nil
-    @Published private(set) var capturedFiles: [URL] = []
     @Published private(set) var zoomMode: LiveZoom.Mode = .fit
     @Published private(set) var zoomFallbackActive: Bool = false
-    /// Relative focus index: client-side running total of commanded manual-focus
-    /// step magnitudes (Near +, Far −) since the last reset. The camera reports
-    /// no absolute focus position, so this is a directional tracker for
-    /// repeatability, NOT physical distance. Reset via `resetFocusPosition()`.
-    @Published private(set) var focusStepPosition: Int = 0
+    /// The AF button is running its sequence.
+    @Published private(set) var autofocusBusy = false
+    /// The glyph on the AF button after a run, nil before the first one and
+    /// while the sharpness check waits for its frame.
+    @Published private(set) var autofocusResult: AppAutofocus.Result? = nil
+
+    /// The exposure advisor's glyph beside the shutter control, nil when
+    /// nothing clips. Checked in manual mode with the camera punch-in off,
+    /// about once a second.
+    @Published private(set) var exposureAdvice: ExposureAdvisor.Advice? = nil
+    private var exposureGate = ExposureAdvisor.Gate()
+    private var exposureCheckAt = Date.distantPast
+    private var exposureCheckBusy = false
+
+    /// The status line's wait glyph (CameraWait): the first config read's
+    /// ladder and the live-view start's. The live-view wait wins while it
+    /// lasts.
+    @Published private(set) var connectWait: CameraWait? = nil
+    @Published private(set) var liveViewWait: CameraWait? = nil
+    var cameraWait: CameraWait? { liveViewWait ?? connectWait }
+    /// Bumped per live-view ladder, so a late progress hop from an earlier
+    /// one cannot put a glyph back.
+    private var liveViewLadderGen = 0
     @Published private(set) var isoChoices: [String] = []
     @Published private(set) var shutterChoices: [String] = []
     @Published private(set) var apertureChoices: [String] = []
     @Published private(set) var imageFormatChoices: [String] = []
-    @Published private(set) var meteringModeChoices: [String] = []
+    @Published private(set) var whiteBalanceChoices: [String] = []
     @Published private(set) var permissionsState: PermissionsState = .init()
-    /// Diagnostic: incremented on every successful snapshot refresh. Used to
-    /// verify @Published observation is wired correctly when UI fields appear
-    /// stuck at defaults despite the backing values updating.
-    @Published private(set) var snapshotTick: Int = 0
-    /// Toggle for the metering / zoom box overlay in the LV pane. Default
-    /// is now ON (like the Cmd-P toggle, it should just stay on) and persisted
+    private var snapshotTick: Int = 0
+    /// Toggle for the zoom box in the LV pane. On by default and persisted
     /// via AppSettings.
     var showMeteringOverlay: Bool {
         get { AppSettings.shared.showMeteringOverlay }
@@ -99,8 +122,8 @@ final class AppModel: ObservableObject {
             objectWillChange.send()
         }
     }
-    /// Normalized [0,1] x [0,1] center point of the metering / zoom rect.
-    /// Default = dead center. Drag on the overlay updates this.
+    /// Normalized [0,1] x [0,1] center point of the zoom box, in sensor
+    /// space. Starts at the center.
     @Published var meteringCenter: CGPoint = CGPoint(x: 0.5, y: 0.5)
     /// Focus peaking overlay toggle. Persisted via AppSettings so the
     /// last on/off state is remembered across launches.
@@ -144,28 +167,48 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Horizontal mirror on the preview, proxied like rotation. Display-only.
+    /// Rotate-then-mirror by convention (see PreviewMirror). With the four
+    /// rotations this reaches all eight orientations, so a vertical flip is
+    /// Mirror plus 180° and needs no control of its own.
+    var previewMirrored: Bool {
+        get { AppSettings.shared.previewMirrored }
+        set {
+            AppSettings.shared.previewMirrored = newValue
+            objectWillChange.send()
+        }
+    }
+
+    /// Direction twin of `sensorPoint(fromDisplay:)`, for arrow keys: undo the
+    /// mirror (display space), then un-rotate. Straightening is not applied
+    /// to directions, unlike `sensorPoint(fromDisplay:)`.
+    func sensorDelta(fromDisplay d: CGVector) -> CGVector {
+        previewRotation.sensorDelta(fromDisplay: PreviewMirror.unmirror(d, mirrored: previewMirrored))
+    }
+
     /// Aspect ratio the preview pane should letterbox to. The body streams 3:2
     /// at every zoom level, so only rotation can change this.
     var previewAspectRatio: CGFloat {
-        previewRotation.displayAspect(sensorAspect: 3.0 / 2.0)
+        previewRotation.displayAspect(sensorAspect: sensorAspectRatio)
     }
 
-    /// How the preview is scaled on screen. Session state, not persisted,
-    /// Fit is the right thing to land on every time you sit down.
+    /// How the preview is scaled on screen. Session state, not persisted, so
+    /// every launch starts at Fit.
     @Published private(set) var previewZoom: PreviewZoom = .fit
     /// Size of the preview pane in points, reported by the view layer. Feeds the
     /// live "Fit (N%)" readout, so it has to come from real laid-out geometry
     /// rather than an assumption about window size.
     @Published var previewPaneSize: CGSize = .zero
     /// Base zoom to restore when a momentary Shift-hold punch-in ends. Without
-    /// this, releasing Shift always dropped to Fit even if you were at 100%.
+    /// this, releasing Shift would always drop to Fit even from 100%.
     private var zoomBeforeHold: PreviewZoom = .fit
 
     // MARK: - Preview adjustments (monochrome + click white balance)
 
-    /// Host-side preview corrections, proxied to AppSettings so they persist.
-    /// Display-only: the camera keeps its own settings and captured files are
-    /// never re-encoded. Recorded per scan so the same treatment can be
+    /// Host-side preview corrections, proxied to AppSettings, which persists
+    /// all of them except the base sample. Display-only: the camera keeps its
+    /// own settings and captured files are never re-encoded. Recorded with
+    /// each capture while metadata is on, so the same treatment can be
     /// replayed onto the RAW later.
     var previewAdjustments: PreviewAdjustments {
         get { AppSettings.shared.previewAdjustments }
@@ -175,20 +218,30 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// True while the eyedropper is armed and the next click on the preview
-    /// will sample white balance instead of moving the metering box.
-    @Published private(set) var isPickingWhiteBalance: Bool = false
+    /// The eyedropper's armed state. While armed over an inverted preview it
+    /// shows the negative, derived rather than stored (see `WhiteBalancePick`),
+    /// so every path that disarms also restores the positive.
+    @Published private(set) var wbPick = WhiteBalancePick()
 
-    /// Short-lived status line for the footer, used to explain a refused
-    /// eyedropper sample, which otherwise just looks like a click that did
-    /// nothing.
+    /// True while the eyedropper is armed and the next click on the preview
+    /// will sample white balance instead of moving the zoom box.
+    var isPickingWhiteBalance: Bool { wbPick.isArmed }
+
+    /// What the preview draws with: the user's adjustments, with the negative
+    /// shown while a pick is armed. The preview renderer reads this. A
+    /// capture's metadata and the saved settings read `previewAdjustments`,
+    /// which the armed negative never changes.
+    var displayedAdjustments: PreviewAdjustments { wbPick.displayed(previewAdjustments) }
+
+    /// Short-lived status line for the footer, such as the reason an
+    /// eyedropper sample was refused.
     @Published private(set) var notice: String? = nil
     private var noticeTask: Task<Void, Never>?
 
-    /// Most recent frame as it came off the camera, before any adjustment.
-    /// The eyedropper samples this rather than what's on screen: sampling the
-    /// corrected preview would compound corrections, so clicking the same spot
-    /// twice would drift instead of being a no-op.
+    /// Most recent frame before any adjustment (under the zoom fallback,
+    /// after the host crop). The eyedropper samples this rather than what's on
+    /// screen: sampling the corrected preview would compound corrections, so
+    /// clicking the same spot twice would drift instead of being a no-op.
     private var lastUnadjustedFrame: Data?
 
     func toggleMonochrome() {
@@ -197,35 +250,41 @@ final class AppModel: ObservableObject {
     }
 
     /// Flip the preview between the raw negative and the positive it will
-    /// become. Display only, the captured RAW is still the negative.
+    /// become. The captured RAW is still the negative. The flag is recorded
+    /// in the capture's metadata so the developing app knows which way we
+    /// were looking.
+    ///
+    /// Mid-pick it reads what is on screen: pressed while the pick shows the
+    /// negative it means "show the positive", so it cancels the pick and
+    /// leaves the preview where the user just put it.
     func toggleInvert() {
-        previewAdjustments.invert.toggle()
+        var user = previewAdjustments
+        let canceled = wbPick.toggleInvert(&user)
+        if user != previewAdjustments { previewAdjustments = user }
         appLog.info("preview invert → \(self.previewAdjustments.invert, privacy: .public)")
-        // White-balance picking is blocked while inverted (see
-        // `canPickWhiteBalance`). Disarm on the way in, or the button would grey
-        // out while the pane still sampled on the next click.
-        if previewAdjustments.invert, isPickingWhiteBalance {
-            isPickingWhiteBalance = false
-            showNotice("White balance picking cancelled — switch to Negative to sample")
-        }
+        if canceled { showNotice("White balance pick canceled") }
     }
 
-    /// White balance can only be sampled from the un-inverted negative.
+    /// White balance can be picked with live view on, inverted or not.
     ///
-    /// Sampling actually works fine while inverted, the eyedropper reads the
-    /// original frame either way, but with the preview flipped, the film base
-    /// is the *darkest* part of the picture rather than the brightest, so the
-    /// operator is being asked to click the opposite of what they've learned to
-    /// look for. Blocking it is a deliberate guard against picking the wrong
-    /// spot, not a technical limitation.
+    /// With the preview inverted the film base is the *darkest* part of the
+    /// picture rather than the brightest, which invites clicking the wrong
+    /// spot, so an armed pick shows the negative (`displayedAdjustments`) and
+    /// the positive comes back when it ends.
+    ///
+    /// Blocked at 100% (.actual): the pane draws a center crop there, so the
+    /// click coordinate cannot be mapped to the pixel under it. At 5x the
+    /// sampled frame is the magnified one, so the click maps there too.
     var canPickWhiteBalance: Bool {
-        isLiveViewOn && !previewAdjustments.invert
+        isLiveViewOn && previewZoom != .actual
     }
 
     /// Arm or disarm the white-balance eyedropper.
     func toggleWhiteBalancePicker() {
-        isPickingWhiteBalance.toggle()
-        if isPickingWhiteBalance {
+        wbPick.toggle()
+        if wbPick.showsNegativeForPick(previewAdjustments) {
+            showNotice("Click the film base to set white balance. Showing the negative while you pick.")
+        } else if wbPick.isArmed {
             showNotice("Click the film base to set white balance")
         }
     }
@@ -233,7 +292,7 @@ final class AppModel: ObservableObject {
     func resetWhiteBalance() {
         previewAdjustments.whiteBalance = nil
         previewAdjustments.baseSample = nil
-        isPickingWhiteBalance = false
+        wbPick.disarm()
         showNotice("White balance reset to as-shot")
         appLog.info("white balance reset")
     }
@@ -241,9 +300,9 @@ final class AppModel: ObservableObject {
     /// Sample the frame at `point` (normalized, y-down, unrotated sensor space)
     /// and set the white balance that renders it neutral.
     func sampleWhiteBalance(atSensor point: CGPoint) {
-        isPickingWhiteBalance = false
+        wbPick.disarm()
         guard let jpeg = lastUnadjustedFrame else {
-            showNotice("No frame to sample — start live view first")
+            showNotice("No frame to sample. Start live view first.")
             return
         }
         guard let s = PreviewPipeline.sampleColor(jpeg: jpeg, atNormalized: point) else {
@@ -253,16 +312,24 @@ final class AppModel: ObservableObject {
         guard let gains = ChannelGains.neutralizing(red: s.red, green: s.green, blue: s.blue) else {
             // Refusing beats applying a wild correction from a near-black
             // sample, but the user needs to know why nothing happened.
-            showNotice("That spot is too dark to balance from — pick a brighter one")
+            showNotice("That spot is too dark to balance from. Pick a brighter one.")
             return
         }
         previewAdjustments.whiteBalance = gains
-        // Keep the raw measurement: gains are clamped (lossy) and Film
-        // Positive wants the measured base itself for its spectral cross-check.
-        previewAdjustments.baseSample = BaseSample(red: s.red, green: s.green, blue: s.blue)
+        // Keep the raw measurement too, because the gains are clamped (lossy)
+        // and Film Positive reads the measured base itself. The point is
+        // recorded in crop space (the straightened frame, before the quarter
+        // turn) so it can find the same patch of base.
+        // `point` itself is in raw-frame space because that is what was sampled.
+        let recorded = FineRotation.straightened(
+            point, byDegrees: previewStraightenDegrees, aspect: sensorAspectRatio)
+        previewAdjustments.baseSample = BaseSample(
+            red: s.red, green: s.green, blue: s.blue,
+            point: .init(x: Double(recorded.x), y: Double(recorded.y)))
         appLog.info("white balance set: r=\(gains.red, privacy: .public) g=\(gains.green, privacy: .public) b=\(gains.blue, privacy: .public)")
-        showNotice(String(format: "White balance set (R %.2f  G %.2f  B %.2f)",
-                          gains.red, gains.green, gains.blue))
+        // The notice leaves out the gains. They are in the log line above, the
+        // WB button's tooltip, and the footer when that readout is on.
+        showNotice("White balance set")
     }
 
     private func showNotice(_ text: String) {
@@ -291,13 +358,19 @@ final class AppModel: ObservableObject {
     }
 
     /// Set the display zoom and bring the camera's punch-in in line with it.
-    /// Only 500% needs the body involved; Fit and 100% are host-side scaling of
+    /// Only 500% needs the body involved. Fit and 100% are host-side scaling of
     /// the same full-frame stream, so switching between those two costs no USB
     /// traffic at all.
     func setPreviewZoom(_ z: PreviewZoom) async {
         let wasPunchedIn = previewZoom.engagesCameraPunchIn
         self.previewZoom = z
         appLog.info("preview zoom → \(z.rawValue, privacy: .public)")
+        // Disarm rather than leaving the eyedropper armed behind a pane that
+        // no longer takes its click.
+        if z == .actual, isPickingWhiteBalance {
+            wbPick.disarm()
+            showNotice("White balance pick canceled. Clicks can't be placed at 100%, so use Fit or 500%.")
+        }
         guard z.engagesCameraPunchIn != wasPunchedIn else { return }
         await applyZoom(z.engagesCameraPunchIn ? .fivex : .fit)
     }
@@ -312,6 +385,325 @@ final class AppModel: ObservableObject {
         appLog.info("preview rotation → \(self.previewRotation.rawValue, privacy: .public)°")
     }
 
+    func toggleMirror() {
+        previewMirrored.toggle()
+        appLog.info("preview mirror → \(self.previewMirrored, privacy: .public)")
+    }
+
+    // MARK: - Straightening
+
+    /// Rotation of the preview beyond the quarter turn, in degrees clockwise.
+    /// The band just outside the crop box's grips drives it.
+    ///
+    /// It turns the *picture* under a crop box that stays square to the screen,
+    /// so the operator can see whether a film edge has been brought level
+    /// against the box. Display-only, like every other preview treatment: the
+    /// camera is never told and the captured RAW is never re-encoded. The angle
+    /// is recorded in the capture's metadata instead, so the crop it produced
+    /// can be reproduced later.
+    var previewStraightenDegrees: Double {
+        get { AppSettings.shared.previewStraightenDegrees }
+        set {
+            AppSettings.shared.previewStraightenDegrees = FineRotation.clamped(newValue)
+            objectWillChange.send()
+        }
+    }
+
+    var isStraightened: Bool { !FineRotation.isNegligible(previewStraightenDegrees) }
+
+    /// Signed, one decimal: a tenth of a degree is a visible amount of
+    /// straightening across a 5000-pixel negative, and the sign is the thing
+    /// the operator is reading, so it is quoted in display
+    /// handedness. With the mirror on, sensor +1.4° looks like −1.4° on
+    /// screen, and a readout disagreeing with the picture reads as broken.
+    /// The metadata records the sensor-space value instead.
+    var straightenLabel: String { String(format: "%+.1f°", displayStraightenDegrees) }
+
+    /// The straightening as the overlay's rotate band reads and writes it: in
+    /// the chirality of what is on screen. A horizontal mirror reverses
+    /// handedness, so with the mirror on, a drag the operator sees as
+    /// clockwise is counter-clockwise in sensor space. Negating here lets the
+    /// drag follow the screen while the stored angle stays in sensor space.
+    var displayStraightenDegrees: Double {
+        get { previewMirrored ? -previewStraightenDegrees : previewStraightenDegrees }
+        set { previewStraightenDegrees = previewMirrored ? -newValue : newValue }
+    }
+
+    func resetStraightening() {
+        guard isStraightened else { return }
+        previewStraightenDegrees = 0
+        showNotice("Straightening cleared")
+    }
+
+    /// Aspect ratio of the frame as the camera sends it. Every body we speak to
+    /// streams 3:2 at every zoom level, so only the display rotation can change
+    /// what is on screen (see `previewAspectRatio`).
+    var sensorAspectRatio: CGFloat { 3.0 / 2.0 }
+
+    /// Take a point the operator indicated on screen back to the pixel of the
+    /// frame the camera sent, undoing the mirror, the quarter turn and the
+    /// straightening in that order.
+    ///
+    /// Both the eyedropper and the zoom box are defined against the raw
+    /// frame (one samples it, the other names a sensor region the body will
+    /// punch into), so both come back through here. The component transforms
+    /// are tested in ScanTests.
+    func sensorPoint(fromDisplay p: CGPoint) -> CGPoint {
+        FineRotation.unstraightened(
+            previewRotation.sensorPoint(
+                fromDisplay: PreviewMirror.unmirror(p, mirrored: previewMirrored)),
+            byDegrees: previewStraightenDegrees,
+            aspect: sensorAspectRatio)
+    }
+
+    // MARK: - Crop
+
+    /// The crop, in sensor space: normalized [0,1]², y-down, against the
+    /// straightened frame as the camera sends it, before the quarter turn.
+    ///
+    /// Sensor space because that is this codebase's structural rule (see
+    /// `PreviewRotation`) and because it makes the quarter-turn button free:
+    /// turning the view cannot move a box that was never expressed in the
+    /// view's coordinates.
+    ///
+    /// Editing still happens in display space (`cropDisplayRect` is what the
+    /// overlay binds to), because a quarter turn is the only rotation that
+    /// carries an axis-aligned rectangle to another one, so the two
+    /// representations are exactly interconvertible and the editor never has to
+    /// reason about rotation.
+    ///
+    /// Persistence hangs off the property itself rather than off each place
+    /// that changes it. A drag writes UserDefaults on every event, which is an
+    /// in-memory dictionary write coalesced to disk.
+    @Published private(set) var cropSensorRect: CGRect? = AppSettings.shared.cropSensorRect {
+        didSet { AppSettings.shared.cropSensorRect = cropSensorRect }
+    }
+
+    /// The crop as the overlay sees it: the same rectangle, turned into the
+    /// orientation on screen.
+    var cropDisplayRect: CGRect? {
+        get {
+            cropSensorRect.map {
+                PreviewMirror.mirrorRect(previewRotation.displayRect(fromSensor: $0),
+                                         mirrored: previewMirrored)
+            }
+        }
+        set {
+            cropSensorRect = newValue.map {
+                previewRotation.sensorRect(
+                    fromDisplay: PreviewMirror.mirrorRect($0, mirrored: previewMirrored))
+            }
+        }
+    }
+
+    var isCropActive: Bool { cropSensorRect != nil }
+
+    /// True while the box is being adjusted. The overlay takes the pointer
+    /// while this is true and the eyedropper is not armed.
+    ///
+    /// The overlay covers the whole pane (it has to, because a crop taken to
+    /// the negative's edge puts its rotate band out in the letterbox), so
+    /// leaving it interactive after the box is settled would put it between
+    /// the operator and click-to-move-the-zoom-box and everything else
+    /// underneath. See `CropInteraction` for why fixed mode removes the
+    /// gesture.
+    ///
+    /// Restored as `false` on launch for the same reason.
+    @Published private(set) var isCropEditing = false
+
+    /// Format the session expects, carried from one negative to the next.
+    ///
+    /// An operator works through a stack of one format, so the last confirmed
+    /// one is a strong prior for the next, strong enough to reject a detection
+    /// whose shape no such frame could have. Persisted, because a session
+    /// usually resumes where it left off.
+    var expectedFilmSize: FilmSize? {
+        get { AppSettings.shared.expectedFilmSize }
+        set {
+            AppSettings.shared.expectedFilmSize = newValue
+            objectWillChange.send()
+        }
+    }
+
+    /// Pixel size of the most recent capture, so the crop can be reported in
+    /// the coordinates of the file it will be applied to rather than the
+    /// preview's.
+    @Published private(set) var lastCaptureSize: CGSize?
+
+    /// Pixel size of the image the crop is quoted against, in sensor
+    /// orientation: the captured file when one has arrived, the live frame
+    /// until then.
+    ///
+    /// The two arrive in different orientations. `lastCaptureSize` is read
+    /// from the RAW, which the body never rotates, so it is already
+    /// sensor-oriented. `latestFrame` is the composed preview, which has been
+    /// through the quarter turn, so at 90° and 270° its width and height are
+    /// the other way round, and this swaps them back.
+    var cropReferenceSensorSize: CGSize? {
+        if let captured = lastCaptureSize { return captured }
+        guard let frame = latestFrame?.size else { return nil }
+        return previewRotation.swapsAxes
+            ? CGSize(width: frame.height, height: frame.width) : frame
+    }
+
+    /// The same image's size as it appears on screen, for anything quoted
+    /// against `cropDisplayRect`.
+    var cropReferenceDisplaySize: CGSize? {
+        cropReferenceSensorSize.map {
+            previewRotation.swapsAxes ? CGSize(width: $0.height, height: $0.width) : $0
+        }
+    }
+
+    /// The crop in the reference image's pixels, for the footer readout and
+    /// the auto-crop notice.
+    ///
+    /// Quoted against the *display* rectangle and the display frame's size,
+    /// because that is the picture the operator is looking at while reading the
+    /// number. The metadata records the sensor-space rectangle instead, which
+    /// is the one a downstream tool can apply without knowing how the preview
+    /// happened to be turned.
+    var cropPixelRect: CGRect? {
+        guard let r = cropDisplayRect, let size = cropReferenceDisplaySize,
+              size.width > 0, size.height > 0 else { return nil }
+        return CGRect(x: r.minX * size.width, y: r.minY * size.height,
+                      width: r.width * size.width, height: r.height * size.height)
+    }
+
+    /// What this live-view session has learned about the size of its own frames.
+    ///
+    /// The planner-anchored route builds its box from the expected format's
+    /// nominal dimensions and lands consistently large. `FrameScale` remembers
+    /// the size of every box a measured route produced and, once it holds
+    /// three, resizes a planner-anchored box to their median, holding
+    /// whichever edge the planner pinned. An operator works a stack of the
+    /// same film on the same stand, so one negative's size predicts the next.
+    ///
+    /// Session-scoped, and reset in `startLiveView()`: a new session is
+    /// usually a new stand height or a new format, and the old median would
+    /// pull its boxes toward the wrong size.
+    private var frameScale = FrameScale()
+
+    /// Slack added to a detected crop, as a fraction of its own size.
+    ///
+    /// Detection stops on the boundary it found, so a crop taken exactly there
+    /// can shave the outermost row of picture. On a 5300-pixel-wide 120 frame
+    /// this works out at about 13 px overall, under 7 px a side, enough to
+    /// stop the crop biting into the image, small enough that it doesn't
+    /// visibly admit rebate.
+    static let autoCropSlack = 0.0025
+
+    /// Find the negative and put a crop box on it. Button-triggered, never
+    /// automatic: detection firing on its own while film is still being
+    /// positioned is worse than none.
+    func runAutoCrop() {
+        guard let jpeg = lastUnadjustedFrame else {
+            showNotice("No frame to crop. Start live view first.")
+            return
+        }
+        // Runs against the frame as the camera sent it, straightened but
+        // otherwise untouched. Inversion, monochrome and white-balance gains
+        // are the operator's view of the film rather than the film, and
+        // detection should see the film.
+        guard let cg = PreviewPipeline.straightenedBitmap(
+            jpeg: jpeg, straightenDegrees: previewStraightenDegrees) else {
+            showNotice("Couldn't read the frame")
+            appLog.error("auto-crop: frame would not decode")
+            return
+        }
+        // Same image as both arms: the live-view frame is a negative, and the
+        // sprocket holes read brighter than the rebate on every stock, which is
+        // the polarity `PerforationFrame`'s negative arm reads.
+        guard let result = AutoCrop.detect(in: cg, expecting: expectedFilmSize, negative: cg) else {
+            showNotice("No negative found. Set the crop by hand, or check the framing.")
+            appLog.info("auto-crop: no plan")
+            return
+        }
+        let final = frameScale.refined(result)
+        cropSensorRect = CropBox.sanitized(
+            CropBox.expanded(final.rect, byFraction: Self.autoCropSlack))
+        isCropEditing = true
+        if result.route.isMeasured { frameScale.learn(from: result) }
+
+        // Learn from a detection we believed, so the next negative has a prior.
+        // Only from the two rungs that measured the frame's own width:
+        // `.perforationAnchored` takes its width from the expected format's
+        // ratio, so learning the format back off it would be circular, the same
+        // reason `.plannerAnchored` is excluded.
+        // Sensor-oriented on purpose: `result.rect` came out of the detector in
+        // sensor space, so pairing it with the display's dimensions would hand
+        // the matcher a transposed frame on a rotated preview and make it pick
+        // the portrait format for a landscape negative.
+        if result.route == .plannerDetected || result.route == .frameFinderBounded,
+           let size = cropReferenceSensorSize {
+            let px = CGSize(width: result.rect.width * size.width,
+                            height: result.rect.height * size.height)
+            let match = FilmSizeMatcher.bestMatch(forCropSize: px, in: FilmSize.seedCatalog)
+            if FilmSize.detectionMayReplace(expectedFilmSize, other: AppSettings.shared.filmSizeOther != nil, with: match) {
+                expectedFilmSize = match
+            }
+        }
+
+        showNotice(AutoCrop.notice(for: result.route, pixelSize: cropPixelRect?.size))
+        appLog.info("auto-crop \(result.route.rawValue, privacy: .public) rect=\(String(describing: final.rect), privacy: .public) angle=\(String(format: "%.2f", result.angle), privacy: .public) scaleSamples=\(self.frameScale.sampleCount, privacy: .public) calibrated=\(self.frameScale.isCalibrated ? "Y" : "N", privacy: .public)")
+    }
+
+    /// Fix the box in place and hand the pointer back.
+    func fixCrop() {
+        guard isCropActive, isCropEditing else { return }
+        isCropEditing = false
+        showNotice("Crop fixed. Click-to-move works again.")
+    }
+
+    /// Go back to adjusting a fixed crop.
+    func adjustCrop() {
+        guard isCropActive, !isCropEditing else { return }
+        isCropEditing = true
+    }
+
+    func toggleCropEditing() {
+        if isCropEditing { fixCrop() } else { adjustCrop() }
+    }
+
+    /// Slide the crop box to the middle of the frame, size unchanged.
+    func centerCrop() {
+        guard let r = cropSensorRect else { return }
+        cropSensorRect = CropBox.centered(r)
+        showNotice("Crop centered")
+    }
+
+    func clearCrop() {
+        guard isCropActive else { return }
+        cropSensorRect = nil
+        isCropEditing = false
+        showNotice("Crop cleared")
+    }
+
+    /// The crop and straightening as they go into a capture's metadata, or nil
+    /// when there is no crop to record.
+    var cropRecord: TreatmentRecord.Crop? {
+        guard let r = cropSensorRect else { return nil }
+        return TreatmentRecord.Crop(
+            x: Double(r.minX), y: Double(r.minY),
+            width: Double(r.width), height: Double(r.height),
+            straightenDegrees: isStraightened ? previewStraightenDegrees : 0,
+            filmSizeID: expectedFilmSize.flatMap { $0.isUnknown ? nil : $0.id })
+    }
+
+    /// Pixel dimensions of an image file, from its header alone.
+    ///
+    /// `CGImageSourceCopyPropertiesAtIndex` never decodes, which is what makes
+    /// this affordable: it runs on every capture, against files that are 5000
+    /// pixels wide and RAW.
+    private static func pixelSize(of url: URL) -> CGSize? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Double,
+              let h = props[kCGImagePropertyPixelHeight] as? Double,
+              w > 0, h > 0
+        else { return nil }
+        return CGSize(width: w, height: h)
+    }
+
     /// Cycle to the next peaking color. Wraps around after the last.
     func cycleFocusPeakingColor() {
         let all = FocusPeaking.PeakColor.allCases
@@ -322,6 +714,7 @@ final class AppModel: ObservableObject {
         focusPeakingColor = all[(idx + 1) % all.count]
         appLog.info("focus peaking color → \(self.focusPeakingColor.rawValue, privacy: .public)")
     }
+
     var isLiveViewOn: Bool { ui == .streaming }
 
     struct PermissionsState: Equatable {
@@ -329,7 +722,6 @@ final class AppModel: ObservableObject {
         var inputMonitoring: Bool = false
     }
 
-    // Held by AppModel after the connection is ready.
     private var connection: CameraConnection?
     private var session: CameraSession?
     private var properties: CameraProperties?
@@ -338,78 +730,54 @@ final class AppModel: ObservableObject {
     private var liveZoom: LiveZoom?
     private var hotkey: HoldKeyMonitor?
     private var connectionTask: Task<Void, Never>?
+    private var waitTask: Task<Void, Never>?
     private var liveViewTask: Task<Void, Never>?
     private var hotkeyTask: Task<Void, Never>?
     private var snapshotRefreshTask: Task<Void, Never>?
-    /// Background drain of libgphoto2's event queue. Runs continuously while
-    /// connected so we pick up property-change events the body emits during
-    /// EVF (shutterspeed changes from the auto-meter, focusmode toggles,
-    /// lensname on attach, etc). Without this loop the only way to learn
-    /// the body's current state was to ask via gp_camera_get_config, which
-    /// fights the EVF stream for the USB pipe. Event drain is push-based
-    /// and free; the body is going to emit the events whether we drain
-    /// them or not. Source: gphoto2 --wait-event probe on the 7D.
+
+    /// Previous raw camera-clock reading, used to tell a live value from the
+    /// ptp2 driver's per-session cache (the driver reports the clock once per
+    /// session, so identical consecutive reads mean we are looking at the cache).
+    private var lastRawCameraClock: Date?
+    /// Background drain of libgphoto2's event queue. Runs while live view
+    /// streams (started in startLiveView, canceled in stopLiveView and stop)
+    /// to pick up property-change events the body emits during EVF, such as
+    /// shutterspeed changes from the auto-meter and focusmode toggles.
+    /// Without this loop the body's current state would come only from
+    /// gp_camera_get_config, which fights the EVF stream for the USB pipe.
+    /// The body emits the events whether they are drained or not. Source:
+    /// gphoto2 --wait-event probe on the 7D.
     private var eventDrainTask: Task<Void, Never>?
-    /// Periodic meter-kick task. Fires Press Half / Release Half every ~2s
-    /// during LV so the body emits a shutterspeed change event reflecting
-    /// the CAPTURE-meter value (which on this body differs from the LV
-    /// meter; the footer can read 1/100 while capture fires 1/150).
-    /// Runs only while LV is streaming; cancelled before LV teardown so
-    /// the body has a quiet pipe for viewfinder=0.
-    private var meterKickTask: Task<Void, Never>?
-    /// Holds CameraEvents on the actor side. Wrapped here so the event-drain
-    /// task can reach it via a weak self.
     private var cameraEvents: CameraEvents?
-    /// Zoom probe spawned by startLiveView. Must be cancelled in stopLiveView,
-    /// otherwise its pending setZoom + fetchOnePreview calls will fire *after*
-    /// the user's stop, re-opening the EVF (shutter re-opens audibly) and
-    /// leaving the body in a state where the next Start is a no-op.
-    private var zoomProbeTask: Task<Void, Never>?
-    /// Cached zoom-probe result. Once we know whether camera-side zoom works
-    /// for this session we don't re-run the probe on every LV start.
-    private var zoomProbed: Bool = false
-    private var fpsLastFrameAt: Date? = nil
-    private var emaFps: Double = 0
+    /// A drain call is (or may be about to be) reading camera events. See
+    /// runEventDrain and waitForEventDrainIdle.
+    private var eventDrainActive = false
+    /// Camera ops inside withLVPriority, plus a capture in flight. Autofocus
+    /// waits for this to reach 0 before its first write, and every such op
+    /// waits for autofocus before counting itself in, so an AF run does not
+    /// overlap another camera op unless that wait times out
+    /// (afIdleWaitSeconds).
+    private var cameraOpsInFlight = 0
+    /// Set once autofocus has the camera (no op in flight), cleared when its
+    /// closing cancel is back. Ops wait on this, not on autofocusBusy, so an
+    /// op nested inside another op cannot deadlock against an AF press that
+    /// is still waiting for the outer op to finish.
+    private var autofocusRunning = false
     private var captureKeyMonitor: Any?
-    /// Where the camera-side zoom box is currently centered, in body pixel
-    /// coordinates. Updated by zoom-engage (synced from meteringCenter) and
-    /// by each arrow nudge. Previously each nudge sent (center + step)
-    /// regardless of where the body was zoomed, so arrows nudged left/right
-    /// only once and then stopped moving. Stateful tracking fixes that.
-    private var zoomBodyCenter: (x: Int, y: Int) = (2592, 1728)  // Evf-space center (5184×3456/2); recomputed on zoom
-    /// Canon's `eoszoomposition` lives in the Evf (full-image) coordinate
-    /// system, measured via an x-sweep on the 7D: x=0 → left edge,
-    /// x≈2000 → middle, x≈4147 → right clamp. That's the 5184×3456 full-image
-    /// space (NOT the 1056×704 LV JPEG; an earlier 1024×680 assumption is
-    /// exactly why positioning never moved off the left edge). This is
-    /// the same big coordinate system EOS Utility drives.
-    /// Measured `eoszoomposition` mapping (template-match calibration,
-    /// NCC 0.995 on two frames). The zoom rect's top-left in the
-    /// 1056×704 OUTPUT relates to the eoszoomposition value by a straight line:
-    ///   fit_px = origin + eoszoom × fitPxPerUnit
-    /// Pinned exactly by x=0→fit-x 46 and x=3000→fit-x 617 (slope 0.1903,
-    /// origin 46). We invert it to drive the zoom to where the box is. The
-    /// +46/+50 origin (camera's zoom origin isn't the frame corner) was the
-    /// systematic offset that made earlier mapping land short.
-    /// Inverse of the camera's MEASURED zoom response (5-point corner+center
-    /// dump). The 7D's eoszoom space maps to an INSET, COMPRESSED region of
-    /// the displayed FOV (FOV/scale relationship, confirmed):
-    /// eoszoom (0,0) lands the zoom CENTER at (0.133, 0.222), not the corner,     /// and eoszoom (4455,3120) lands it at (0.855, 0.842). So we invert that
-    /// response: eoszoom = (box - offset) × gain, clamped to the camera range.
-    /// Hardware limit: eoszoom can't go negative, so the zoom can't reach above
-    /// ~0.12 (top) or left of ~0.04, a real 7D border, not a software bug.
-    static let zoomRespOffset = CGPoint(x: 0.133, y: 0.222)
-    static let zoomRespGain   = CGPoint(x: 6168, y: 5033)   // 1/measured-slope
-    static let zoomEoszoomMax = CGPoint(x: 5000, y: 3800)   // camera clamps internally too
-    /// The 5× zoom region as a fraction of the frame (measured 0.199). The box
-    /// is drawn this size; the clamp + nudge use it too.
-    static let zoomBoxFraction: CGFloat = 0.199
-    private var observedLVFrameSize: (w: Int, h: Int)?
+    /// Where the camera's 5x punch-in can land and the `eoszoomposition`
+    /// value for each landing, measured on the body (see `PunchInGrid`). The
+    /// box is drawn at the reachable center nearest the point the user chose,
+    /// so it shows where the punch-in goes.
+    static let punchIn = PunchInGrid.eos7D
+    /// The 5x zoom region as a fraction of the frame. The box is drawn this
+    /// size, and the clamp and nudge use it too.
+    static let zoomBoxFraction: CGFloat = punchIn.boxFraction.width
 
     // MARK: - Lifecycle
 
     func start() async {
         refreshPermissions()
+        TextEntryFocus.startTracking()
         startCaptureKeyMonitor()
         let conn = await CameraConnection()
         self.connection = conn
@@ -419,34 +787,60 @@ final class AppModel: ObservableObject {
                 await self?.handleConnectionState(state)
             }
         }
+        waitTask = Task { [weak self] in
+            for await w in conn.waitStream {
+                self?.connectWait = w
+            }
+        }
     }
 
     func stop() async {
         connectionTask?.cancel()
+        waitTask?.cancel()
         liveViewTask?.cancel()
         hotkeyTask?.cancel()
         snapshotRefreshTask?.cancel()
         snapshotRefreshTask = nil
         eventDrainTask?.cancel()
         eventDrainTask = nil
-        meterKickTask?.cancel()
-        meterKickTask = nil
         cameraEvents = nil
         hotkey?.stop()
         if let monitor = captureKeyMonitor {
             NSEvent.removeMonitor(monitor)
             captureKeyMonitor = nil
         }
-        if let lv = liveView { try? await lv.stop() }   // cancels the LV loop (+ async EVF teardown)
+        // Quit only: the UI Stop path is stopLiveView(), which keeps the
+        // session open. The steps log their offset from here, so an Export
+        // Log from Help shows the sequence.
+        let t0 = Date()
+        func at() -> Int { Int(Date().timeIntervalSince(t0) * 1000) }
+        let wasStreaming = await liveView?.isActive ?? false
+        appLog.info("quit: begin, live view \(wasStreaming ? "on" : "off", privacy: .public)")
+        // No presence poll during the teardown: it would put USB traffic
+        // between the EVF-off writes and the drain.
+        if let conn = connection { await conn.stopPolling() }
+        if let lv = liveView {
+            try? await lv.stop()   // cancels the LV loop, then viewfinder=0 and output=TFT, both awaited
+            appLog.info("quit: t+\(at(), privacy: .public) ms EVF-off writes returned")
+            // Closing the session straight after output=TFT can leave the body
+            // wedged until a battery pull. Let the EVF-exit burst finish and
+            // read back that EVF is off before gp_camera_exit. The drain is
+            // capped at 1.5 s, inside the 8 s force-quit timer in
+            // applicationShouldTerminate.
+            if wasStreaming {
+                // A slow body can spend the budget in the EVF writes. Past 4 s
+                // the readback (one full config fetch) is skipped, so quit
+                // still reaches gp_camera_exit before the 8 s timer.
+                let r = await lv.settleBeforeExit(readBack: at() < 4000)
+                appLog.info("quit: t+\(at(), privacy: .public) ms settled (\(String(describing: r.verdict), privacy: .public), \(r.events, privacy: .public) events), viewfinder=\(r.viewfinder ?? "unreadable", privacy: .public) output=\(r.output ?? "unreadable", privacy: .public)")
+            }
+        }
         // Close the libgphoto2 session so the USB/PTP claim is released.
-        // stopMonitoring() already calls session.close() (gp_camera_exit, which
-        // also drops EVF), but we await it explicitly too for safety. The slow
-        // explicit viewfinder/output writes that used to be here were REMOVED:
-        // they were USB transactions that blew applicationWill-
-        // Terminate's ~4s budget, so the close never ran, producing a long quit
-        // with the camera left open. gp_camera_exit handles the EVF teardown.
+        // stopMonitoring() already calls session.close() (gp_camera_exit), and
+        // the explicit close is a no-op second guard.
         if let conn = connection { await conn.stopMonitoring() }
         await session?.close()
+        appLog.info("quit: t+\(at(), privacy: .public) ms gp_camera_exit returned, session closed")
         connection = nil
         session = nil
         properties = nil
@@ -467,10 +861,9 @@ final class AppModel: ObservableObject {
             self.liveZoom = nil
             self.ui = .disconnected
             self.latestFrame = nil
-            // Reset per-session state so the next connection re-probes zoom etc.
-            self.zoomProbed = false
-            zoomProbeTask?.cancel()
-            zoomProbeTask = nil
+            // New session means a new driver cache, so the next clock reading
+            // is fresh and must be allowed to set the offset.
+            self.lastRawCameraClock = nil
             liveViewTask?.cancel()
             liveViewTask = nil
         case .enumerating:
@@ -494,20 +887,11 @@ final class AppModel: ObservableObject {
             let evts = await CameraEvents(session: sess)
             self.cameraEvents = evts
             self.ui = .ready
-            // Datetime sync was previously automatic on every connect. A body
-            // went into the fatal "shooting is not possible, remove the
-            // battery" error during an app restart with nothing else changing,
-            // which is symptomatic of a libgphoto2 widget write that the 7D
-            // firmware can't handle in some state. syncdatetimeutc was the
-            // only write on the connect path, so it's the prime suspect. Now
-            // user-triggered only, call model.syncCameraClock() from a menu.
-            // Start the frame consumer ONCE per connection. AsyncStream isn't a
-            // proper multicast subject, re-iterating it across stop/start cycles
-            // (which the previous design did by recreating liveViewTask in
-            // startLiveView) caused the second iterator to see an empty stream,
-            // even when runLoop was clearly yielding frames per logs.
-            // Long-lived consumer: runLoop's start()/stop() controls whether
-            // frames flow; this loop just drains whatever arrives.
+            // Start the frame consumer once per connection. AsyncStream is not a
+            // multicast subject: iterating it again across stop/start cycles
+            // leaves the second iterator seeing an empty stream while runLoop is
+            // still yielding frames. runLoop's start()/stop() controls whether
+            // frames flow, and this loop drains whatever arrives.
             liveViewTask?.cancel()
             liveViewTask = Task { [weak self] in
                 for await frame in lv.frameStream {
@@ -518,131 +902,216 @@ final class AppModel: ObservableObject {
             await loadChoices()
             startHotkey()
             startSnapshotRefresh()
-            // NOTE: eventDrainTask is NOT started here. Starting it at
-            // connect-ready meant the drain held the actor continuously
-            // while idle, which kept the body's PTP daemon busy enough
-            // that subsequent setViewfinder(0/1) writes failed to actually
-            // move the mirror: the mirror failed to close or open on
-            // Stop/Start. Drain only
-            // matters during LV (metered Tv is an LV-only signal), so we
-            // start it in startLiveView() and stop it in stopLiveView().
-            // Opt-in auto-sync of the camera clock to host LOCAL wall time.
-            // Default ON in AppSettings so the date is set automatically.
-            // Local (not UTC)
-            // is the fix for the EXIF DateTimeOriginal drift on bodies whose
-            // internal TZ setting doesn't match the host (see
-            // CameraProperties.syncDateTimeToHostLocal for the full story).
+            // eventDrainTask is not started here. Started at connect-ready, the
+            // drain holds the actor continuously while idle, which keeps the
+            // body's PTP daemon busy enough that later setViewfinder(0/1) writes
+            // fail to move the mirror: it fails to close or open on Stop/Start.
+            // The drain only matters during live view (metered Tv is a
+            // live-view-only signal), so startLiveView() starts it and
+            // stopLiveView() stops it.
+
+            // Sync the camera clock to host local wall time (on by default in
+            // AppSettings). Local rather than UTC keeps EXIF DateTimeOriginal
+            // right on bodies whose internal time zone setting doesn't match
+            // the host (see CameraProperties.syncDateTimeToHostLocal).
+            //
+            // The 7D can go into its fatal "shooting is not possible, remove the
+            // battery" error after a libgphoto2 widget write its firmware can't
+            // handle in some state. The clock write is the only write the app
+            // makes on the connect path, so it is the first suspect, though not
+            // a proven cause. The clock sync has its own setting so it can be
+            // turned off.
             if AppSettings.shared.autoSyncClockOnConnect {
                 Task { [weak self] in await self?.syncCameraClockLocal() }
             }
-        case .error(let msg):
-            self.ui = .error(message: msg, hint: hintForMessage(msg))
+        case .error(let err):
+            showCameraError(err, during: .connect)
         }
     }
 
-    private func hintForMessage(_ msg: String) -> String? {
-        let lower = msg.lowercased()
-        if lower.contains("firmware") { return "Update your camera's firmware to the latest supported version (camera menu → wrench → Firmware Ver.)." }
-        if lower.contains("usb") || lower.contains("claim") { return "Quit Image Capture and Photos, then unplug/replug the camera." }
-        if lower.contains("timeout") || lower.contains("i/o") {
-            return "Camera may be in a wedged state. Power the camera off, wait 3 seconds, power it on. The app will reconnect automatically."
+    /// Shows a camera error through `cameraAdvice`: a plain first line, a hint
+    /// saying what to try, and the raw code behind the error card's info icon.
+    /// The two internal-state errors in `handleConnectionState` set `ui`
+    /// directly and have no hint.
+    private func showCameraError(_ error: Error, during op: CameraAdvice.Operation) {
+        let advice = cameraAdvice(for: error, during: op)
+        appLog.error("camera error shown (\(String(describing: op), privacy: .public)): \(advice.message, privacy: .public) | \(advice.detail ?? "", privacy: .public)")
+        self.ui = .error(message: advice.message, hint: advice.hint, detail: advice.detail)
+    }
+
+    /// Maps an error to the message, hint and detail the user reads.
+    private func cameraAdvice(for error: Error, during op: CameraAdvice.Operation) -> CameraAdvice {
+        if let e = error as? CameraError {
+            return CameraAdvice.advice(for: e, during: op,
+                                       cameraAppsRunning: OtherCameraApps.cameraAppsRunning(),
+                                       // The PTP daemon check runs pgrep, so only on connect.
+                                       ptpDaemonRunning: op == .connect && OtherCameraApps.ptpDaemonRunning(),
+                                       claimSeenInSeries: op == .connect && (connection?.claimSeenInSeries.isSet ?? false))
         }
-        if lower.contains("not detected") || lower.contains("no") { return "Set the camera's Communication menu to PTP." }
-        return nil
+        return CameraAdvice.advice(forOther: error, during: op)
     }
 
     // MARK: - Live view
 
     func startLiveView() async {
         appLog.info("startLiveView() called")
-        guard let lv = liveView, let zoom = liveZoom else {
+        guard let lv = liveView, liveZoom != nil else {
             appLog.error("startLiveView: liveView or liveZoom nil")
             return
         }
-        // Reset overlay rect to dead center every LV session so it returns to
-        // the center of the frame each time.
+        // A second press while the start, or its stall ladder, is still
+        // running would start a second ladder against the same body.
+        guard !liveViewStarting else {
+            appLog.info("startLiveView: a start is already running, ignored")
+            return
+        }
+        liveViewStarting = true
+        defer { liveViewStarting = false }
         self.meteringCenter = CGPoint(x: 0.5, y: 0.5)
+        // A new session is usually a new stand height or a new format, so the previous
+        // session's median frame size is not evidence about this one.
+        self.frameScale = FrameScale()
         do {
-            try await lv.start()
+            try await startLiveViewUnderBudget(lv)
             self.ui = .streaming
             appLog.info("startLiveView: ui → .streaming")
-            // Event drain is LV-coupled, only useful for picking up metered
-            // Tv changes, which only happen during EVF. Start it after the
-            // mirror is up; cancel in stopLiveView so the next mirror-down
-            // write has a quiet PTP channel.
+            // The event drain runs only during live view, see the note in
+            // handleConnectionState(.ready).
             startEventDrain()
-            // startMeterKick() REMOVED, every-2s Press Half writes wedged
-            // the body's firmware (needed power-cycle to recover). The 7D
-            // can't tolerate sustained Press Half cycling even with C.Fn
-            // IV-1 = AE lock. Tradeoff: footer's metered shutter no longer
-            // updates in real-time; it only reflects what the LV-meter
-            // emits (rare in Av/P modes) plus what arrives via the once-
-            // per-capture Press Half. There may be NO safe way to get
-            // real-time capture-meter parity on this body via libgphoto2.
-            // NOTE: liveViewTask is started ONCE per connection in
-            // handleConnectionState(.ready). Recreating it here would re-iterate
-            // an already-consumed AsyncStream and silently see no frames.
+            // No periodic meter kick here: Press Half writes every 2 s wedge
+            // the body's firmware until a power cycle. The 7D can't tolerate
+            // sustained Press Half cycling even with C.Fn IV-1 = AE lock. So
+            // the footer's metered shutter does not update in real time. It
+            // reflects what the live-view meter emits (rare in Av and P modes)
+            // plus what arrives through the Press Half each capture sends. A
+            // kick would make the body emit the capture-meter value, which on
+            // the 7D differs from the live-view meter (the footer can read
+            // 1/100 while capture fires 1/150). No safe way to get real-time
+            // capture-meter parity on the 7D through libgphoto2 is known.
 
-            // 7D-only: we already know from prior probes that camera-side
-            // eoszoom works (returns supported=true every time). Skipping the
-            // probe entirely eliminates the visible "flash of zoom" on
-            // LV start, the probe was running setZoom(.fivex) then back
-            // to .fit which was visible in the preview pane. Hardcoded to
-            // supported=true; zoomFallbackActive stays false.
-            zoomProbed = true
+            // Camera-side eoszoom is assumed to work (on the 7D a probe found
+            // it supported every time), so nothing probes it here. A probe
+            // shows a visible "flash of zoom" on LV start, because it sets
+            // setZoom(.fivex) and then back to .fit while the preview pane is
+            // showing. zoomFallbackActive stays false until applyZoom finds
+            // no LiveZoom or a zoom write throws.
             zoomFallbackActive = false
-            _ = zoom  // silence unused warning while keeping the parameter shape
         } catch let err as CameraError {
             appLog.error("startLiveView CameraError: \(err.localizedDescription, privacy: .public)")
-            self.ui = .error(message: err.localizedDescription, hint: nil)
+            showCameraError(err, during: .liveView)
         } catch {
             appLog.error("startLiveView error: \(String(describing: error), privacy: .public)")
-            self.ui = .error(message: "\(error)", hint: nil)
+            showCameraError(error, during: .liveView)
+        }
+    }
+
+    /// True from a live-view start's first write until its ladder ends.
+    private var liveViewStarting = false
+
+    static let liveViewStartStage = "live view start"
+
+    /// The live-view start under the stall ladder (StallLadder.swift): 45 s,
+    /// then close the stuck session from off the camera thread and throw the
+    /// error `StallHistory.recordStall` returns, or `.notAnswering`. No USB
+    /// reset and no retry in the app. Throws the start's own error
+    /// when it fails in time.
+    private func startLiveViewUnderBudget(_ lv: LiveView) async throws {
+        let box = LiveViewStallBox(lv: lv, session: session)
+        liveViewLadderGen &+= 1
+        let gen = liveViewLadderGen
+        // The ladder owns the connection until it ends: no presence poll may
+        // connect or disconnect under it (CameraConnection.pollHold).
+        let conn = connection
+        conn?.pollHold.set()
+        let t0 = Date()
+        let log: @Sendable (String) -> Void = { line in
+            let ms = Int((Date().timeIntervalSince(t0) * 1000).rounded())
+            appLog.info("liveview: t+\(ms, privacy: .public) ms \(line, privacy: .public)")
+        }
+        // No reset in the app, so no reconnect and no retry: a stall is close,
+        // then the card (StallLadder.swift header).
+        let ladder = StallLadder.app
+        let io = StallIO(
+            attempt: { _ in
+                guard let lv = box.liveView else { throw CameraError.liveViewNotActive }
+                try await lv.start()
+            },
+            close: { box.session?.closeFromWatchdog() ?? "no session" },
+            // The caller below is not stuck (only the camera thread is) and
+            // throws the advice itself.
+            advise: {},
+            log: log,
+            progress: { [weak self] p in
+                Task { @MainActor in self?.noteLiveViewProgress(p, gen: gen) }
+            })
+        defer { liveViewWait = nil }
+        switch await StallGuard.run(stage: AppModel.liveViewStartStage, ladder: ladder, io: io) {
+        case .answered:
+            conn?.pollHold.clear()
+        case .failed(let error, _):
+            conn?.pollHold.clear()
+            throw error
+        case .notAnswering:
+            // Queued on the camera actor, so it runs when the thread comes
+            // free, which is the power cycle: it drops the stuck session, only
+            // that one, and hands the connection back to the presence poll,
+            // which then opens a fresh session.
+            let stuck = box.session
+            if let conn { Task { await conn.dropStalledSession(stuck) } }
+            // recordStall returns the restart-the-Mac error only for a stall,
+            // power cycle, stall sequence (StallHistory), and the plain
+            // not-answering error otherwise.
+            throw conn?.stallHistory.recordStall(stage: AppModel.liveViewStartStage)
+                ?? CameraError.notAnswering(stage: AppModel.liveViewStartStage)
+        }
+    }
+
+    /// A live-view ladder's progress, hopped onto the main actor. Only the
+    /// current ladder while it runs may set the glyph.
+    private func noteLiveViewProgress(_ p: StallProgress, gen: Int) {
+        guard gen == liveViewLadderGen, liveViewStarting else { return }
+        switch p {
+        case .attempt(1): liveViewWait = CameraWait(activity: .startingLiveView, since: Date())
+        case .attempt: break
+        case .finished: liveViewWait = nil
         }
     }
 
     func stopLiveView() async {
         appLog.info("stopLiveView() called (ui=\(String(describing: self.ui), privacy: .public))")
-        zoomProbeTask?.cancel()
-        zoomProbeTask = nil
-        // Stop the event drain AND the meter-kick BEFORE writing viewfinder=0,
-        // so the body's PTP daemon has a quiet channel to actually drop the
-        // mirror.
+        // A stop between DoAf and the closing cancel would leave the half
+        // press latched, so it waits for the run to end.
+        await waitForAutofocusIdle()
+        // Stop the event drain before writing viewfinder=0, so the body's PTP
+        // daemon has a quiet channel to drop the mirror.
         eventDrainTask?.cancel()
         eventDrainTask = nil
-        meterKickTask?.cancel()
-        meterKickTask = nil
         if let lv = liveView {
             do { try await lv.stop(); appLog.info("LiveView.stop() OK") }
             catch { appLog.error("LiveView.stop() failed: \(String(describing: error), privacy: .public)") }
         }
         if case .streaming = ui { self.ui = .ready; appLog.info("stopLiveView: ui → .ready") }
         latestFrame = nil
+        exposureAdvice = nil
+        exposureGate.reset()
         // Nothing left to sample, so an armed eyedropper would just fail on the
         // next click. The white balance itself is kept, it belongs to the film,
         // not to the live-view session.
         lastUnadjustedFrame = nil
-        isPickingWhiteBalance = false
-        // Reset zoom state so the next LV session starts at fit + center,
-        // not whatever the last session left it at. Without this, the body's
-        // zoom position persists across LV restarts (because we never
-        // explicitly set it back to fit/center on stop) and the next Space-
-        // hold zooms to the prior position instead of the current overlay
-        // location.
+        wbPick.disarm()
+        // The next live view session starts at Fit.
         zoomMode = .fit
         previewZoom = .fit
         zoomBeforeHold = .fit
-        zoomBodyCenter = (2592, 1728)  // Evf-space center; recomputed on next zoom anyway
     }
 
     private func handleFrame(_ frame: LiveView.Frame) async {
-        // Gate on streaming state. The long-lived liveViewTask continues
-        // draining lv.frameStream even after the user hits Stop, if runLoop
-        // had a frame buffered when we cancelled, it'll arrive here and
-        // overwrite latestFrame back to the old image. Dropping post-stop
-        // frames keeps the preview pane truly empty when live view is off.
+        // Gate on streaming state. The long-lived liveViewTask keeps draining
+        // lv.frameStream after the user hits Stop. A frame runLoop had
+        // buffered at cancel can still arrive here and put the old image
+        // back in latestFrame, so frames after a stop are dropped.
         guard ui == .streaming else { return }
-        // Live histogram: ~5 Hz is plenty for an exposure aid; skip while
+        // Live histogram: ~5 Hz is plenty for an exposure aid. Skip while
         // zoomed (the card hides then anyway) and while disabled. Computed
         // inside the PreviewPipeline pass below so histogram ticks share the
         // display render's single decode instead of decoding the JPEG twice.
@@ -650,37 +1119,23 @@ final class AppModel: ObservableObject {
         let wantHistogram = AppSettings.shared.histogramEnabled
             && zoomMode == .fit && histFrameTick % 6 == 0
         let now = Date()
-        if let last = fpsLastFrameAt {
-            let dt = now.timeIntervalSince(last)
-            if dt > 0 {
-                let instantaneous = 1.0 / dt
-                emaFps = emaFps == 0 ? instantaneous : (emaFps * 0.8 + instantaneous * 0.2)
-                snapshot.fps = emaFps
-            }
-        }
-        fpsLastFrameAt = now
+        lastFrameJPEG = frame.jpegData
+        lastFrameZoom = afZoomKey
+        if afCheck != nil { noteFrameForAutofocus(frame.jpegData) }
+        noteFrameForExposureAdvice(frame.jpegData, at: now)
 
-        // Capture the FIT-frame dimensions so applyZoom positions eoszoom in
-        // the right coordinate space. Only sample while at fit: the body
-        // streams a different size when punched in (verified empirically:
-        // fit=1056×704, zoom5×=1024×680), and eoszoomposition coordinates are
-        // in the fit-frame space, sampling the zoomed size would skew the
-        // reposition math during arrow-nudges.
-        if zoomMode == .fit, let w = frame.width, let h = frame.height, w > 0, h > 0 {
-            observedLVFrameSize = (w: w, h: h)
-        }
         var jpeg = frame.jpegData
-        // Client-side JPEG crop is now a FALLBACK only. When camera-side
-        // sensor zoom is engaged (zoomFallbackActive == false), the body
-        // already streams the sharp magnified frame, so we pass it straight
-        // through, that's the whole point of the camera-side zoom path. We
-        // only upscale-crop here if the body refused the eoszoom write.
+        // Client-side JPEG crop is a fallback only. When camera-side sensor
+        // zoom is engaged (zoomFallbackActive == false), the body already
+        // streams the sharp magnified frame, so it passes straight through.
+        // The crop here runs when the body refused the eoszoom write or there
+        // is no LiveZoom.
         if zoomMode != .fit, zoomFallbackActive,
            let cropped = JPEGCrop.cropAt(jpeg, divisor: zoomMode.rawValue, center: meteringCenter) {
             jpeg = cropped
         }
-        // Keep the frame exactly as the camera sent it for the eyedropper to
-        // sample; everything below is correction the sample must not see.
+        // Keep the frame for the eyedropper to sample. Everything below is
+        // correction the sample must not see.
         lastUnadjustedFrame = jpeg
         let peaking = focusPeakingEnabled
             ? PreviewPipeline.Peaking(
@@ -692,33 +1147,38 @@ final class AppModel: ObservableObject {
         // One decode, one Core Image graph, one bitmap out, plus the
         // histogram tap on its ticks, sharing that same decode. Returns a nil
         // image when there's nothing to apply, which is the common case, then
-        // the JPEG goes straight to NSImage and Core Image never runs.
+        // the JPEG goes straight to NSImage.
         let (rendered, hist) = PreviewPipeline.renderTapped(
-            jpeg: jpeg, adjustments: previewAdjustments, peaking: peaking,
-            computeHistogram: wantHistogram
+            jpeg: jpeg, adjustments: displayedAdjustments, peaking: peaking,
+            computeHistogram: wantHistogram,
+            straightenDegrees: previewStraightenDegrees
         )
         if let hist { histogramData = hist }
         let base = rendered ?? NSImage(data: jpeg)
-        // Draw the zoom box DIRECTLY INTO the frame (image-pixel space), not as
-        // a separate SwiftUI overlay. This makes the box physically part of the
-        // displayed image, so it can never drift from the image content the way
-        // a floating overlay with its own geometry could, and since the zoom
-        // maps from this same image space, the box and the zoomed region are
-        // the same thing by construction. Drawn only at fit + while hovering.
+        // Draw the zoom box into the frame itself (image-pixel space), not as
+        // a separate SwiftUI overlay, so it cannot drift from the image
+        // content. Drawn only at fit, and only while the zoom box is switched
+        // on.
         var composed = base
         if let base, showMeteringOverlay, zoomMode == .fit {
-            composed = Self.drawZoomBox(on: base, center: meteringCenter,
+            // `meteringCenter` is a sensor coordinate and the frame it is being
+            // drawn onto has been straightened, so the box has to be turned
+            // with it or it slides off the film it marks. Only the center is
+            // mapped: the box itself stays square to the screen.
+            let center = FineRotation.straightened(
+                AppModel.punchIn.snapped(meteringCenter), byDegrees: previewStraightenDegrees,
+                aspect: sensorAspectRatio)
+            composed = Self.drawZoomBox(on: base, center: center,
                                         fraction: AppModel.zoomBoxFraction)
         }
-        // Rotation is deliberately the LAST step: every overlay above was
-        // positioned in sensor space, so turning the finished frame keeps the
-        // box glued to the image content instead of sliding off it.
-        self.latestFrame = composed.map { previewRotation.rotate($0) }
+        // The quarter turn and the mirror apply to the finished frame, so
+        // the box drawn above turns with the image content.
+        self.latestFrame = composed.map { PreviewMirror.apply(previewRotation.rotate($0), mirrored: previewMirrored) }
     }
 
     /// Composite the zoom-target rectangle onto a copy of the frame in image
-    /// pixel coordinates. `center` is normalized [0,1] top-down; NSImage's
-    /// origin is bottom-left so we flip Y.
+    /// pixel coordinates. `center` is normalized [0,1] top-down. NSImage's
+    /// origin is bottom-left, so Y is flipped.
     private static func drawZoomBox(on image: NSImage, center: CGPoint, fraction f: CGFloat) -> NSImage {
         let size = image.size
         guard size.width > 0, size.height > 0 else { return image }
@@ -726,18 +1186,16 @@ final class AppModel: ObservableObject {
         out.lockFocus()
         image.draw(in: CGRect(origin: .zero, size: size))
         let bw = size.width * f, bh = size.height * f
-        // Box is drawn at meteringCenter (already clamped to [f/2, 1-f/2] so it
-        // reaches every edge and never goes off-screen). The constant offset
-        // between box and where the camera zooms is applied in bodyZoomTopLeft
-        // (zoom-side), so the box clamps cleanly here.
+        // The box is drawn at `center` with no offset. The caller passes the
+        // metering center snapped to the punch-in grid and then straightened,
+        // so the box sits where the camera zooms.
         let cx = center.x * size.width
-        let cy = (1 - center.y) * size.height         // flip Y for AppKit coords
+        let cy = (1 - center.y) * size.height
         let rect = CGRect(x: cx - bw/2, y: cy - bh/2, width: bw, height: bh)
         NSColor.white.withAlphaComponent(0.9).setStroke()
         let path = NSBezierPath(rect: rect)
         path.lineWidth = max(1.5, size.width / 480)  // ~2px at 1056-wide
         path.stroke()
-        // small center crosshair
         let ch = NSBezierPath()
         ch.move(to: CGPoint(x: cx - 8, y: cy)); ch.line(to: CGPoint(x: cx + 8, y: cy))
         ch.move(to: CGPoint(x: cx, y: cy - 8)); ch.line(to: CGPoint(x: cx, y: cy + 8))
@@ -750,63 +1208,75 @@ final class AppModel: ObservableObject {
 
     func captureNow() async {
         appLog.info("captureNow() called")
+        // A capture asked for mid-autofocus waits for the closing cancel, and
+        // counts itself so no autofocus starts while it runs (it reads camera
+        // events for FILE_ADDED).
+        await enterCameraOp()
+        defer { cameraOpsInFlight -= 1 }
         guard let cap = capture else {
             appLog.error("captureNow: capture nil, connection not ready?")
             return
         }
         let folder = AppSettings.shared.captureFolder
         let pattern = AppSettings.shared.filenamePattern
-        appLog.info("captureNow → \(folder.path, privacy: .public)/\(pattern, privacy: .public)")
+        appLog.info("captureNow → \(pattern, privacy: .public)")
 
-        // Snapshot the camera/film provenance and fold the live values into
-        // history (so a value typed-but-not-Return'd still gets remembered the
-        // moment it's used on a capture).
+        // With Meta on, fold the live camera and film values into history, so
+        // a value typed but not committed with Return is remembered the moment
+        // it's used on a capture.
         let metaOn = AppSettings.shared.metadataEnabled
         if metaOn {
             AppSettings.shared.commitCamera(AppSettings.shared.shotCamera)
             AppSettings.shared.commitFilm(AppSettings.shared.shotFilm)
+            AppSettings.shared.commitTakenOn(AppSettings.shared.shotTakenOn)
         }
-        // Meta OFF → empty metadata → MetadataWriter.write is a no-op:
-        // no sidecar, no embed, field values untouched for later. The active
-        // preview treatment rides along under the same gate, recorded per
-        // capture only when Meta is ON and only when it carries data.
-        let adj = previewAdjustments
+        // With Meta off the metadata is empty and MetadataWriter.write is a
+        // no-op: no sidecar, no embed, field values untouched for later. The
+        // active preview treatment rides along under the same gate, recorded
+        // per capture only when Meta is on and only when it carries data. It
+        // records the user's own adjustments, never the negative an armed
+        // pick shows.
+        let adj = wbPick.recorded(previewAdjustments)
         let treatment = TreatmentRecord(
             baseSample: adj.baseSample.map { .init(r: $0.red, g: $0.green, b: $0.blue) },
             previewGains: adj.whiteBalance.flatMap {
                 $0.isIdentity ? nil : .init(r: $0.red, g: $0.green, b: $0.blue)
             },
             inverted: adj.invert,
-            monochrome: adj.monochrome
+            monochrome: adj.monochrome,
+            crop: cropRecord,
+            // The shared geometry Film Positive applies after the crop: the
+            // quarter turn and the mirror exactly as the operator had them.
+            rotate: previewRotation.rawValue,
+            flip: previewMirrored,
+            samplePoint: adj.baseSample?.point.map { .init(x: $0.x, y: $0.y) },
+            // Clear Crop leaves the angle in place, so record it on its own
+            // too: what is on screen is what Film Positive gets.
+            straightenDegrees: isStraightened ? previewStraightenDegrees : 0
         )
         let metadata = metaOn
             ? CaptureMetadata(camera: AppSettings.shared.shotCamera,
                               film: AppSettings.shared.shotFilm,
-                              treatment: treatment.isEmpty ? nil : treatment)
+                              treatment: treatment.isEmpty ? nil : treatment,
+                              capturedAt: Date(),
+                              takenOn: AppSettings.shared.shotTakenOn,
+                              filmSizeID: expectedFilmSize.flatMap { $0.isUnknown ? nil : $0.id },
+                              filmSizeName: AppSettings.shared.filmSizeName)
             : CaptureMetadata(camera: "", film: "")
 
-        // The old gp_camera_capture path hung against EVF and so required a
-        // pause/teardown/restart dance. The new eosremoterelease=Immediate
-        // path inside CameraCapture honors the body's current LV+meter state
-        //, capture happens with EVF UP, no mirror flap, no exposure shift.
-        // That dance is gone. We DO still pause-via-priority through
-        // withLVPriority so the capture's USB writes don't fight preview
-        // frame fetches for the same wire.
-        // Keep LV UP through capture. The previous EVF teardown forced the
-        // body's REFLEX meter
-        // (mirror down) to set capture exposure, which differed from the
-        // LV preview (LV meter). EOS Utility doesn't drop the mirror; it
-        // captures with LV up so the same sensor-based meter drives both
-        // preview and captured exposure → they match.
+        // CameraCapture fires gp_camera_capture(GP_CAPTURE_IMAGE) after a
+        // Press Half (what that does to AE depends on C.Fn IV-1, see
+        // AFProbe.swift). Live view stays up through the capture. Tearing
+        // EVF down makes the body's reflex meter (mirror down) set the
+        // capture exposure, which differs from the LV meter that drove the
+        // preview. With LV up the same sensor-based meter drives both preview
+        // and captured exposure, so they match.
         //
-        // Historic concern: gp_camera_capture hung against viewfinder=1
-        // on this body in earlier sessions. Re-testing fresh now that
-        // C.Fn IV-1 is set. If it hangs/wedges, revert this block to
-        // the lv.stop/lv.start dance.
+        // On the 7D, gp_camera_capture has hung with viewfinder=1, so a hang
+        // here may come from keeping live view up.
         //
-        // We DO still pause the LV frame fetch via withLVPriority (handled
-        // inside cap.capture's caller, see kickMeter pattern) so the USB
-        // pipe isn't fighting capture's writes.
+        // The live-view frame fetch still pauses through withLVPriority so
+        // the USB pipe isn't fighting capture's writes.
         var captureResult: CameraCapture.CaptureResult?
         var captureError: Error?
         await withLVPriority {
@@ -819,7 +1289,11 @@ final class AppModel: ObservableObject {
 
         if let result = captureResult {
             self.lastCapture = result.path.lastPathComponent
-            self.capturedFiles.append(contentsOf: result.allPaths)
+            // Dimensions only, read from the file's header without decoding
+            // it. The crop is defined on the preview and applied to this, so
+            // its corners should be quoted in this file's pixels rather than
+            // the live view's much smaller ones.
+            self.lastCaptureSize = Self.pixelSize(of: result.path) ?? self.lastCaptureSize
             self.snapshot.iso = result.iso ?? self.snapshot.iso
             self.snapshot.shutter = result.shutter ?? self.snapshot.shutter
             self.snapshot.aperture = result.aperture ?? self.snapshot.aperture
@@ -829,62 +1303,63 @@ final class AppModel: ObservableObject {
             await refreshSnapshot()
         } else if let err = captureError as? CameraError {
             appLog.error("captureNow CameraError: \(err.localizedDescription, privacy: .public)")
-            self.ui = .error(message: err.localizedDescription, hint: nil)
+            showCameraError(err, during: .capture)
         } else if let err = captureError {
             appLog.error("captureNow error: \(String(describing: err), privacy: .public)")
-            self.ui = .error(message: "\(err)", hint: nil)
+            showCameraError(err, during: .capture)
         }
     }
 
-    func triggerAutofocus() async {
-        appLog.info("triggerAutofocus() called")
-        guard let p = properties else { appLog.error("triggerAutofocus: properties nil"); return }
-        // Wrap in LV-priority pause so the USB pipe is free for the AF
-        // command. Without this the 30 FPS preview stream often hogs USB
-        // and the body never sees a clean window for AF.
-        await withLVPriority {
-            do { try await p.triggerAutofocus() }
-            catch let err as CameraError { appLog.error("triggerAutofocus: \(err.localizedDescription, privacy: .public)") }
-            catch { appLog.error("triggerAutofocus: \(String(describing: error), privacy: .public)") }
-        }
-        await refreshSnapshot()
-    }
-
-    /// Push host *local* wall time → camera (TZ-aware). Used both by the auto-sync
-    /// on connect and the explicit menu / footer click. Local-not-UTC because the
-    /// 7D's EXIF DateTimeOriginal is a wall-clock value, UTC sync leaves a
-    /// host_local - camera_local drift equal to the camera's TZ-vs-host-TZ
-    /// offset (a 1-hour drift was observed with the camera set to PST while
-    /// the host was in PDT). See CameraProperties for the
-    /// detailed why.
+    /// Push host *local* wall time to the camera (time zone aware). Local rather
+    /// than UTC because the 7D's EXIF DateTimeOriginal is a wall-clock value.
+    /// A UTC sync leaves a drift equal to the gap between the camera's time
+    /// zone and the host's (one hour with the camera on PST and the host on
+    /// PDT). CameraProperties has the details.
     func syncCameraClockLocal() async {
         appLog.info("syncCameraClockLocal() called")
-        guard let p = properties else { return }
-        let tzOffset = AppSettings.shared.cameraTZOffsetMinutes
-        do {
-            try await p.syncDateTimeToHostLocal(tzOffsetMinutes: tzOffset)
-            appLog.info("camera datetime synced (tzOffset=\(tzOffset, privacy: .public)min)")
-            await refreshSnapshot()
-        } catch let err as CameraError {
-            appLog.error("syncCameraClockLocal failed: \(err.localizedDescription, privacy: .public)")
-        } catch {
-            appLog.error("syncCameraClockLocal failed: \(String(describing: error), privacy: .public)")
+        guard let p = properties else {
+            showNotice("No camera connected, so the clock can't be set.")
+            return
         }
+        let tzOffset = AppSettings.shared.cameraTZOffsetMinutes
+        // Runs under withLVPriority. Without it the write competes with the
+        // 30 FPS preview stream for the USB pipe and can fail with -110 (I/O in
+        // progress) during live view.
+        var failure: Error?
+        await withLVPriority {
+            do {
+                try await p.syncDateTimeToHostLocal(tzOffsetMinutes: tzOffset)
+                appLog.info("camera datetime synced (tzOffset=\(tzOffset, privacy: .public)min)")
+            } catch {
+                failure = error
+            }
+        }
+        if let failure {
+            let advice = cameraAdvice(for: failure, during: .control)
+            appLog.error("syncCameraClockLocal failed: \(advice.detail ?? String(describing: failure), privacy: .public)")
+            // Surface it, or a failed write looks like a dead button. The raw
+            // libgphoto2 text goes to the log, not the status line.
+            showNotice(["Couldn't set the camera clock.", advice.hint].compactMap { $0 }.joined(separator: " "))
+            return
+        }
+        await refreshSnapshot()
+        // A successful sync sets the camera's clock to the host's, so the offset
+        // is zero by definition. Assert that rather than reading it back: the
+        // driver caches this property per session, and there's no guarantee the
+        // cache reflects a write we just made.
+        var s = snapshot
+        s.cameraClockOffset = 0
+        snapshot = s
+        lastRawCameraClock = s.cameraDateTime
+        showNotice("Camera clock set to this Mac's time")
     }
 
-    /// Legacy menu hook, still wired in FilmTetherApp's commands for users who
-    /// explicitly want UTC sync. New code calls syncCameraClockLocal directly.
-    func syncCameraClock() async {
-        await syncCameraClockLocal()
-    }
-
-    /// Background event drain. While connected we keep one in-flight call
-    /// against gp_camera_wait_for_event with a short timeout, when the body
-    /// emits property events (Tv changes from the auto-meter, lensname on
-    /// attach, etc) we pick them up and update snapshot. This is the
-    /// foundation of real-time metered Tv display in Av mode where the
-    /// shutterspeed widget reads "auto" but the actual value comes through
-    /// the event stream.
+    /// Background event drain. While live view streams it keeps one in-flight
+    /// call against gp_camera_wait_for_event with a short timeout. Property
+    /// events for shutterspeed, iso, aperture, autoexposuremode and focusmode
+    /// update the snapshot (applyEvent). This is what carries metered Tv in
+    /// Av mode, where the shutterspeed widget reads "auto" but the value
+    /// arrives on the event stream.
     private func startEventDrain() {
         eventDrainTask?.cancel()
         eventDrainTask = Task { [weak self] in
@@ -896,20 +1371,25 @@ final class AppModel: ObservableObject {
         guard let evts = cameraEvents else { return }
         appLog.info("event drain: starting")
         while !Task.isCancelled {
+            // Raised before the pause check and lowered once the drain call
+            // returns, so autofocus can wait for it to fall and know no drain
+            // call is still reading events (`waitForEventDrainIdle`). Lowered
+            // before every sleep, never left up across one.
+            eventDrainActive = true
             // Yield to user-priority ops. When `withLVPriority` pauses the
-            // LV runLoop, the same signal pauses us, otherwise we'd be
-            // calling gp_camera_wait_for_event in parallel with capture's
-            // waitForFileAdded and one consumer would eat the other's
-            // events, causing "capture failed: timeout waiting for file
-            // added" on every second shot. 50ms re-check feels instant
-            // when the user op finishes.
+            // live-view runLoop, the same signal pauses the drain. Otherwise
+            // it would read camera events in parallel with capture's own
+            // FILE_ADDED drain, and one consumer would eat the other's events.
+            // A 50 ms re-check feels instant when the user op finishes.
             if let lv = liveView, await lv.isPaused {
+                eventDrainActive = false
                 try? await Task.sleep(nanoseconds: 50_000_000)
                 continue
             }
             // drain() swallows errors internally. Loop only exits on
             // Task.isCancelled.
             let events = await evts.drain(budgetMs: 200, perCallMs: 100)
+            eventDrainActive = false
             if events.isEmpty {
                 try? await Task.sleep(nanoseconds: 100_000_000)
                 continue
@@ -918,12 +1398,11 @@ final class AppModel: ObservableObject {
                 await applyEvent(evt)
             }
         }
+        eventDrainActive = false
         appLog.info("event drain: exited")
     }
 
-    /// Project one camera event onto the UI snapshot. Most events just
-    /// mirror what the body is doing internally; the one that matters
-    /// for user-visible state is shutterspeed changes during metering.
+    /// Project one camera event onto the UI snapshot.
     private func applyEvent(_ evt: CameraEvents.Event) async {
         switch evt {
         case .propertyChanged(let name, let value, _):
@@ -933,13 +1412,12 @@ final class AppModel: ObservableObject {
                 let isAutoish = value.lowercased() == "auto" || value.isEmpty
                 var s = self.snapshot
                 if !isAutoish { s.meteredShutter = value }
-                // In a manual exposure mode the picker should follow the body.
-                // In Av/Tv/P the picker shows "auto", the metered value goes
-                // into meteredShutter only.
-                if s.mode.uppercased().contains("MANUAL") || s.mode.uppercased() == "M" {
+                // The picker takes the event's value where shutter speed is
+                // writable in the current mode (M and Tv among them), or when
+                // the value is auto. In Av and P a numeric value goes into
+                // meteredShutter only.
+                if CameraProperties.pickerFollowsEvent(prop: "shutterspeed", mode: s.mode, value: value) {
                     s.shutter = value
-                } else if isAutoish {
-                    s.shutter = value  // picker shows whatever the body says
                 }
                 self.snapshot = s
                 self.snapshotTick &+= 1
@@ -952,11 +1430,11 @@ final class AppModel: ObservableObject {
                 s.aperture = value
                 self.snapshot = s
             case "autoexposuremode":
-                // Mode-dial turn. This is the ONLY prompt reflection of the
-                // dial during LV streaming (the snapshot poller deliberately
-                // idles then), so update the snapshot's mode immediately,
-                // that alone unlocks/locks the exposure pickers, and refresh
-                // choices after the dial settles.
+                // Mode-dial turn. This event is the only prompt sign of the
+                // dial during live view (the snapshot poller idles then), so
+                // the snapshot's mode updates at once, which alone locks or
+                // unlocks the exposure pickers, and the choices reload after
+                // the dial settles.
                 var s = self.snapshot
                 guard s.mode != value else { break }
                 appLog.notice("mode dial: \(s.mode, privacy: .public) → \(value, privacy: .public) (event), scheduling choices reload")
@@ -964,16 +1442,22 @@ final class AppModel: ObservableObject {
                 self.snapshot = s
                 self.snapshotTick &+= 1
                 scheduleModeChangeRefresh()
-            // focusmode events are useful but PropertySnapshot doesn't surface
-            // focusMode in the UI today, capture path just writes Manual/
-            // One Shot directly. Skip rather than carry dead state.
+            case "focusmode":
+                // Reads "Manual" with the lens switch on MF. The snapshot
+                // poller idles during live view, so this event is what closes
+                // or opens the focus group while streaming.
+                var s = self.snapshot
+                guard s.focusMode != value else { break }
+                appLog.notice("focusmode: \(s.focusMode ?? "unread", privacy: .public) → \(value, privacy: .public) (event)")
+                s.focusMode = value
+                self.snapshot = s
             default:
                 break
             }
         case .fileAdded, .captureComplete, .timeout, .unknown:
-            // Capture path drains its own FILE_ADDED inside CameraCapture;
-            // anything that arrives here was emitted while we weren't
-            // actively capturing, safe to ignore.
+            // The capture path drains its own FILE_ADDED inside CameraCapture.
+            // Anything that arrives here was emitted outside a capture and is
+            // safe to ignore.
             break
         }
     }
@@ -993,24 +1477,30 @@ final class AppModel: ObservableObject {
     }
 
     /// Latest live-histogram sample (nil until first compute). Written inline
-    /// from handleFrame's PreviewPipeline tap, read by HistogramOverlay.
+    /// from handleFrame's PreviewPipeline tap, read by LiveViewPane.
     @Published var histogramData: HistogramData?
     private var histFrameTick: Int = 0
 
-    /// Drop-flag so rapid manual-focus button mashing doesn't queue dozens of
-    /// USB writes. Mashing once fired ~40 writes in 11 seconds and
-    /// blocked a subsequent ISO change with -110 IO_IN_PROGRESS. When one
-    /// drive is already in flight, additional presses are ignored, the
-    /// motor on the body has a physical settle time anyway.
+    /// Set while a manual-focus drive is in flight, so rapid button mashing
+    /// doesn't queue dozens of USB writes. Without it, mashing can fire ~40
+    /// writes in 11 seconds and block a later ISO change with -110
+    /// IO_IN_PROGRESS. While one drive is in flight, further presses are
+    /// ignored. The motor on the body has a physical settle time anyway.
     private var manualFocusInFlight: Bool = false
 
-    /// Drive manual focus by one step in the requested direction. Lens must
-    /// be in AF mode on the lens switch AND body focusmode set to a non-Manual
-    /// value for the motor to actually move, most USM lenses comply when both
-    /// are set right. Watch the live view to confirm the lens moved.
+    /// Drive manual focus by one step in the requested direction. The motor
+    /// moves only with the lens switch on AF and the body's focusmode set to a
+    /// value other than Manual. Most USM lenses comply when both are set.
+    /// Watch the live view to confirm the lens moved.
     func driveManualFocus(_ step: CameraProperties.ManualFocusStep) async {
         if manualFocusInFlight {
             appLog.debug("driveManualFocus(\(step.rawValue, privacy: .public)) dropped, prior write still in flight")
+            return
+        }
+        // No step during an autofocus run, and none with the lens switch on
+        // MF, where the body ignores the drive.
+        if autofocusBusy || focusBlockedByLensSwitch {
+            appLog.debug("driveManualFocus(\(step.rawValue, privacy: .public)) dropped, autofocus running or lens switch on MF")
             return
         }
         manualFocusInFlight = true
@@ -1020,9 +1510,6 @@ final class AppModel: ObservableObject {
         await withLVPriority {
             do {
                 try await p.driveManualFocus(step)
-                // Only advance the relative index once the body accepted the
-                // drive, a thrown write leaves the counter untouched.
-                self.focusStepPosition += step.weight
             }
             catch let err as CameraError { appLog.error("driveManualFocus: \(err.localizedDescription, privacy: .public)") }
             catch { appLog.error("driveManualFocus: \(String(describing: error), privacy: .public)") }
@@ -1030,39 +1517,260 @@ final class AppModel: ObservableObject {
         try? await Task.sleep(nanoseconds: 200_000_000)
     }
 
-    /// Reset the relative focus index to zero, the "you are here" origin the
-    /// readout counts from. Does not move the lens.
-    func resetFocusPosition() { focusStepPosition = 0 }
+    // MARK: - Autofocus
+
+    /// The lens switch is on MF: the AF button and the six step buttons are
+    /// off, and one info icon says why.
+    var focusBlockedByLensSwitch: Bool {
+        AppAutofocus.blockedByLensSwitch(focusMode: snapshot.focusMode)
+    }
+
+    /// The raw body JPEG of the last live-view frame, the before score's source.
+    private var lastFrameJPEG: Data?
+    /// The zoom state that frame was streamed under, recorded with it: a
+    /// Shift punch-in can change the zoom before any zoomed frame arrives.
+    private var lastFrameZoom: AFZoomKey?
+    private var afRunCounter = 0
+
+    /// What the frame the sharpness is scored on must match: a punch-in and
+    /// a fit frame are different images and their scores do not compare.
+    private struct AFZoomKey: Equatable {
+        let mode: LiveZoom.Mode
+        let fallback: Bool
+    }
+    private var afZoomKey: AFZoomKey { AFZoomKey(mode: zoomMode, fallback: zoomFallbackActive) }
+
+    /// A pending result glyph: waiting for the frame after the run.
+    private struct AFSharpnessCheck {
+        let run: Int
+        let before: Data?
+        let zoom: AFZoomKey
+        /// The body reported its lock (d1c0 or a focus event) inside the cap.
+        let markerArrived: Bool
+        /// The body started driving the lens at all.
+        let bodyDrove: Bool
+        var framesSeen = 0
+    }
+    private var afCheck: AFSharpnessCheck?
+    /// How long the result waits for a frame before it settles on not confirmed.
+    private static let afFrameWaitSeconds: UInt64 = 3
+
+    /// One press of the AF button or key. The sequence is AppAutofocus's, with
+    /// the d1c0 marker, inside a paused live-view loop so this run is the only
+    /// reader of camera events. Busy clears when that sequence returns, and a
+    /// successful run's glyph waits for a later frame. One press is one run:
+    /// the app never moves the lens or runs AF again on its own.
+    func autofocus() async {
+        guard !autofocusBusy else { appLog.debug("autofocus: dropped, a run is in flight"); return }
+        guard isLiveViewOn, !focusBlockedByLensSwitch, !manualFocusInFlight else {
+            appLog.debug("autofocus: dropped (live view \(self.isLiveViewOn, privacy: .public), focusmode \(self.snapshot.focusMode ?? "unread", privacy: .public), step in flight \(self.manualFocusInFlight, privacy: .public))")
+            return
+        }
+        guard let p = properties, let evts = cameraEvents, let lv = liveView else { return }
+        autofocusBusy = true
+        autofocusResult = nil
+        afRunCounter &+= 1
+        let run = afRunCounter
+        afCheck = nil
+        // Wait out any camera op already running (a zoom write, a step, a
+        // capture) before the first write, and give up rather than overlap
+        // one.
+        guard await waitForCameraOpsIdle() else {
+            appLog.error("af: run \(run, privacy: .public) dropped, another camera op did not finish in \(Int(AppModel.afOpsWaitSeconds), privacy: .public) s")
+            autofocusBusy = false
+            return
+        }
+        // Read after the wait: a zoom write that was in flight has landed and
+        // its first frame may have too. The before frame's own zoom is
+        // what the after frame must match.
+        let before = lastFrameJPEG
+        let zoom = lastFrameZoom ?? afZoomKey
+        appLog.notice("af: start run \(run, privacy: .public), zoom \(String(describing: zoom.mode), privacy: .public), focusmode \(self.snapshot.focusMode ?? "unread", privacy: .public)")
+        let result: (outcome: AppAutofocus.Outcome, error: Error?, seen: [CameraEvents.Event]) = await lv.withPriority {
+            await self.waitForEventDrainIdle()
+            let io = await CameraAFIO(props: p, events: evts)
+            let outcome = await AppAutofocus.run(io: io)
+            let error = await io.firstError
+            let seen = await io.seen
+            return (outcome: outcome, error: error, seen: seen)
+        }
+        for line in AppAutofocus.logLines(result.outcome) {
+            appLog.notice("\(line, privacy: .public)")
+        }
+        autofocusRunning = false
+        autofocusBusy = false
+        // The run was the only event reader for up to 7 s. Hand what it read
+        // to the snapshot, so a lens switch flipped mid-run still lands.
+        for evt in result.seen { await applyEvent(evt) }
+        if result.outcome.failed {
+            let advice = result.error.map { cameraAdvice(for: $0, during: .autofocus) }
+                ?? CameraAdvice.advice(forOther: AFFailure(text: result.outcome.trace.error
+                                                           ?? result.outcome.trace.cleanupError ?? "unknown"),
+                                       during: .autofocus)
+            appLog.error("af: failed: \(advice.message, privacy: .public) | \(advice.detail ?? "", privacy: .public)")
+            autofocusResult = .failed(advice)
+            return
+        }
+        let markerArrived = result.outcome.completion == .marker || result.outcome.completion == .focusEvent
+        let bodyDrove = result.outcome.bodyDrove
+        if !bodyDrove {
+            appLog.notice("af: run \(run, privacy: .public): the camera took the command and never started driving (no \(AppAutofocus.driveProperty, privacy: .public), no marker)")
+        }
+        afCheck = AFSharpnessCheck(run: run, before: before, zoom: zoom,
+                                   markerArrived: markerArrived, bodyDrove: bodyDrove)
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: AppModel.afFrameWaitSeconds * 1_000_000_000)
+            guard let self, let c = self.afCheck, c.run == run else { return }
+            self.afCheck = nil
+            appLog.notice("af: no frame within \(AppModel.afFrameWaitSeconds, privacy: .public) s to score, not confirmed")
+            self.concludeAF(run: run,
+                            result: AppAutofocus.notConfirmed(.noFrame(waitSeconds: Int(AppModel.afFrameWaitSeconds))))
+        }
+    }
+
+    /// Shows an AF run's result, unless a newer run has started.
+    private func concludeAF(run: Int, result: AppAutofocus.Result) {
+        guard afRunCounter == run else { return }
+        autofocusResult = result
+    }
+
+    /// The trace's text for a failure that kept no error object.
+    private struct AFFailure: Error, CustomStringConvertible { let text: String; var description: String { text } }
+
+    /// Called from handleFrame while a result is pending. The first frame
+    /// after a pause can be the stale buffered one, so the score comes from
+    /// the second.
+    private func noteFrameForAutofocus(_ jpeg: Data) {
+        guard var c = afCheck else { return }
+        c.framesSeen += 1
+        afCheck = c
+        guard c.framesSeen >= 2 else { return }
+        afCheck = nil
+        guard c.zoom == afZoomKey else {
+            // The operator changed the zoom mid-run. That is not a focus
+            // failure, so the result is shown as is.
+            appLog.notice("af: zoom changed during the run, nothing comparable to score, not confirmed")
+            autofocusResult = AppAutofocus.notConfirmed(.zoomChanged)
+            return
+        }
+        let run = c.run, before = c.before, marker = c.markerArrived, drove = c.bodyDrove
+        Task.detached(priority: .utility) { [weak self] in
+            let b = before.flatMap { Sharpness.score(jpeg: $0) }
+            let a = Sharpness.score(jpeg: jpeg)
+            await self?.finishAFCheck(run: run, before: b, after: a,
+                                      markerArrived: marker, bodyDrove: drove)
+        }
+    }
+
+    /// The body is in manual exposure, where the shutter is ours to suggest.
+    var isManualExposureMode: Bool {
+        let m = snapshot.mode.uppercased()
+        return m.contains("MANUAL") || m == "M"
+    }
+
+    /// About once a second, measure how much of the frame's center
+    /// clips, off the main actor, and let the gate decide the glyph. Only at
+    /// fit zoom, since a punch-in frame is a different region of the film.
+    private func noteFrameForExposureAdvice(_ jpeg: Data, at now: Date) {
+        guard isManualExposureMode, zoomMode == .fit else {
+            if exposureAdvice != nil || exposureGate.showing { exposureAdvice = nil; exposureGate.reset() }
+            return
+        }
+        guard !exposureCheckBusy, now.timeIntervalSince(exposureCheckAt) >= 1 else { return }
+        exposureCheckBusy = true
+        exposureCheckAt = now
+        Task.detached(priority: .utility) { [weak self] in
+            let share = ExposureAdvisor.clippedShare(jpeg: jpeg)
+            await self?.finishExposureAdvice(share: share)
+        }
+    }
+
+    private func finishExposureAdvice(share: Double?) {
+        exposureCheckBusy = false
+        guard isLiveViewOn, isManualExposureMode, let share else { return }
+        let show = exposureGate.update(share: share)
+        exposureAdvice = show
+            ? ExposureAdvisor.advice(clippedShare: share, current: snapshot.shutter, choices: shutterChoices)
+            : nil
+    }
+
+    /// The scores are in: hand the verdict to concludeAF, unless a newer run
+    /// has started.
+    private func finishAFCheck(run: Int, before b: Double?, after a: Double?,
+                               markerArrived: Bool, bodyDrove: Bool) {
+        guard afRunCounter == run else { return }
+        let verdict = AppAutofocus.conclusion(before: b, after: a, markerArrived: markerArrived, bodyDrove: bodyDrove)
+        let held = b.flatMap { b in a.map { AppAutofocus.heldFocus(before: b, after: $0, markerArrived: markerArrived) } } ?? false
+        let word = verdict.isConfirmed ? (held ? "confirmed (locked on a frame already in focus)" : "confirmed") : "not confirmed"
+        appLog.notice("af: run \(run, privacy: .public) sharpness \(b.map { String(format: "%.1f", $0) } ?? "none", privacy: .public) → \(a.map { String(format: "%.1f", $0) } ?? "none", privacy: .public), marker \(markerArrived ? "yes" : "no", privacy: .public), drive \(bodyDrove ? "yes" : "no", privacy: .public), \(word, privacy: .public)")
+        concludeAF(run: run, result: verdict)
+    }
+
+    /// Wait until no event-drain call is reading, so the autofocus run is the
+    /// one consumer (its events must not be eaten). The live-view pause is
+    /// already up, so no new drain call starts. This waits out one in flight,
+    /// at most about 300 ms (200 ms budget, 100 ms per call).
+    private func waitForEventDrainIdle() async {
+        let deadline = Date().addingTimeInterval(1)
+        while eventDrainActive && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        if eventDrainActive { appLog.error("af: event drain still reading after 1 s, going ahead") }
+    }
+
+    /// A capture can take several seconds. Past this, autofocus gives up.
+    private static let afOpsWaitSeconds: TimeInterval = 15
+
+    /// Wait for camera ops already running to finish. False when one is still
+    /// going at the bound, and the run must not start.
+    private func waitForCameraOpsIdle() async -> Bool {
+        let deadline = Date().addingTimeInterval(AppModel.afOpsWaitSeconds)
+        while cameraOpsInFlight > 0 && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        // Checked and claimed with no suspension between, the mirror of
+        // withLVPriority's wait-then-count.
+        guard cameraOpsInFlight == 0 else { return false }
+        autofocusRunning = true
+        return true
+    }
+
+    /// Wait for any autofocus run to end, then count this op in, with no
+    /// suspension between the check and the count so autofocus cannot claim
+    /// the camera in the gap. The caller decrements `cameraOpsInFlight`.
+    private func enterCameraOp() async {
+        let deadline = Date().addingTimeInterval(AppModel.afIdleWaitSeconds)
+        while autofocusRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if autofocusRunning { appLog.error("camera op going ahead with autofocus still running after \(Int(AppModel.afIdleWaitSeconds), privacy: .public) s") }
+        cameraOpsInFlight += 1
+    }
+
+    /// A run is about 7 s (6 s wait plus writes and the tail read), plus up
+    /// to 1 s for an in-flight drain and the 100 ms settle, so only a hung
+    /// camera call reaches this.
+    private static let afIdleWaitSeconds: TimeInterval = 15
+
+    /// Hold stopLiveView until the autofocus run ends (see afIdleWaitSeconds).
+    private func waitForAutofocusIdle() async {
+        guard autofocusRunning else { return }
+        appLog.info("camera op waiting for autofocus to finish")
+        let deadline = Date().addingTimeInterval(AppModel.afIdleWaitSeconds)
+        while autofocusRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
 
     /// Pause runLoop's frame fetching (via pauseCount), do the work, resume.
-    /// Body state preserved, no mirror cycle, no focus loss. The AF cancel
-    /// chaser in triggerAutofocus handles the body's AF-acquired state
-    /// without needing a full LV teardown.
-    ///
-    /// If AF still wedges the body with just light pause + cancel, the AF
-    /// button will be removed entirely (autofocus is optional).
+    /// The body stays in live view: no mirror cycle, no focus loss.
     private func withLVPriority<T>(_ work: () async -> T) async -> T {
+        // A camera op asked for during an autofocus run waits for it to end
+        // rather than landing between its DoAf and its closing cancel.
+        await enterCameraOp()
+        defer { cameraOpsInFlight -= 1 }
         guard let lv = liveView, isLiveViewOn else { return await work() }
         return await lv.withPriority { await work() }
-    }
-
-    func setMeteringMode(_ value: String) async {
-        guard let p = properties else { return }
-        await withLVPriority {
-            do {
-                try await p.setMeteringMode(value)
-                self.clearTransientErrorIfStreamingReady()
-            }
-            catch let err as CameraError { self.ui = .error(message: err.localizedDescription, hint: nil) }
-            catch { self.ui = .error(message: "\(error)", hint: nil) }
-        }
-        await refreshSnapshot()
-    }
-
-    /// Latched punch-in toggle, kept for any caller that wants a straight
-    /// in/out flip rather than the three-state cycle on the toolbar button.
-    func toggleZoom() async {
-        await setPreviewZoom(previewZoom.engagesCameraPunchIn ? .fit : .fiveX)
     }
 
     func setImageFormat(_ value: String) async {
@@ -1071,28 +1779,47 @@ final class AppModel: ObservableObject {
         await withLVPriority {
             do {
                 try await p.setImageFormat(value)
-                self.clearTransientErrorIfStreamingReady()
+                await self.clearTransientErrorIfStreamingReady()
             }
-            catch let err as CameraError { self.ui = .error(message: err.localizedDescription, hint: nil) }
-            catch { self.ui = .error(message: "\(error)", hint: nil) }
+            catch { self.showCameraError(error, during: .control) }
         }
         await refreshSnapshot()
     }
 
     // MARK: - Property setters
 
+    /// True when the body's white balance is the mode that uses the Kelvin
+    /// value. The stepper dims when it is false.
+    var kelvinIsActive: Bool {
+        snapshot.whiteBalance.caseInsensitiveCompare(
+            CameraProperties.colorTemperatureMode
+        ) == .orderedSame
+    }
+
+    func setWhiteBalanceMode(_ value: String) async {
+        guard let p = properties else { return }
+        await withLVPriority {
+            do {
+                try await p.setWhiteBalance(value)
+                await self.clearTransientErrorIfStreamingReady()
+            }
+            catch { self.showCameraError(error, during: .control) }
+        }
+        await refreshSnapshot()
+        appLog.info("white balance mode → \(value, privacy: .public)")
+    }
+
     func setISO(_ value: String) async {
         guard let p = properties else { return }
         await withLVPriority {
             do {
                 try await p.setIso(value)
-                self.clearTransientErrorIfStreamingReady()
+                await self.clearTransientErrorIfStreamingReady()
             }
-            catch let err as CameraError { self.ui = .error(message: err.localizedDescription, hint: nil) }
-            catch { self.ui = .error(message: "\(error)", hint: nil) }
+            catch { self.showCameraError(error, during: .control) }
         }
         await refreshSnapshot()
-        // kickMeter() removed from settings-change path, Press Half writes
+        // No meter kick on the settings-change path: Press Half writes
         // (even occasional) correlate with body wedges that need power-cycle.
     }
 
@@ -1101,10 +1828,9 @@ final class AppModel: ObservableObject {
         await withLVPriority {
             do {
                 try await p.setShutter(value)
-                self.clearTransientErrorIfStreamingReady()
+                await self.clearTransientErrorIfStreamingReady()
             }
-            catch let err as CameraError { self.ui = .error(message: err.localizedDescription, hint: nil) }
-            catch { self.ui = .error(message: "\(error)", hint: nil) }
+            catch { self.showCameraError(error, during: .control) }
         }
         await refreshSnapshot()
     }
@@ -1114,10 +1840,9 @@ final class AppModel: ObservableObject {
         await withLVPriority {
             do {
                 try await p.setAperture(value)
-                self.clearTransientErrorIfStreamingReady()
+                await self.clearTransientErrorIfStreamingReady()
             }
-            catch let err as CameraError { self.ui = .error(message: err.localizedDescription, hint: nil) }
-            catch { self.ui = .error(message: "\(error)", hint: nil) }
+            catch { self.showCameraError(error, during: .control) }
         }
         await refreshSnapshot()
     }
@@ -1127,62 +1852,25 @@ final class AppModel: ObservableObject {
         await withLVPriority {
             do {
                 try await p.setWhiteBalanceKelvin(k)
-                self.clearTransientErrorIfStreamingReady()
+                await self.clearTransientErrorIfStreamingReady()
             }
-            catch let err as CameraError { self.ui = .error(message: err.localizedDescription, hint: nil) }
-            catch { self.ui = .error(message: "\(error)", hint: nil) }
+            catch { self.showCameraError(error, during: .control) }
         }
         await refreshSnapshot()
     }
 
-    /// Start a periodic meter-kick task. Fires kickMeter() every ~2 seconds
-    /// while LV is streaming so the footer's metered shutter updates even
-    /// when the user is just sliding film (no settings changes to piggyback
-    /// on). It re-meters every couple of seconds so sliding film alone still
-    /// updates the meter.
-    private func startMeterKick() {
-        meterKickTask?.cancel()
-        meterKickTask = Task { [weak self] in
-            while !Task.isCancelled {
-                // 2s cadence: fast enough that scene changes are visible
-                // within ~2s; slow enough that the body isn't constantly
-                // ticking AE locks. With C.Fn IV-1 = AE lock / AF, Press
-                // Half is cheap, no AF noise, no mirror movement.
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if Task.isCancelled { return }
-                await self?.kickMeter()
-            }
+    /// Called after a successful write: if an error is showing, clear it so
+    /// it doesn't leave a stale message in the UI. Only ever leaves .error,
+    /// and it returns to .streaming or .ready by whether the stream is active.
+    private func clearTransientErrorIfStreamingReady() async {
+        guard case .error = ui else { return }
+        let streamActive = await liveView?.isActive ?? false
+        guard case .error = ui else { return }
+        switch ClearedErrorState.after(streamActive: streamActive) {
+        case .streaming: ui = .streaming
+        case .ready: ui = .ready
         }
-    }
-
-    /// Fire one Press Half / Release Half cycle to nudge the body's auto-meter
-    /// into emitting the "what would capture meter" shutterspeed value. With
-    /// C.Fn IV-1 = "AE lock / AF" on the body, this is just a brief AE lock
-    /// (no AF noise, no extra mirror activity). The shutterspeed change event
-    /// gets caught by runEventDrain → updates snapshot.meteredShutter →
-    /// footer shows the capture-meter value. Without this, the LV meter and
-    /// capture meter diverge and the footer can read 1/100 while capture
-    /// fires 1/150.
-    ///
-    /// Best-effort: skipped silently if LV is off (no point) or if the
-    /// widget writes fail. Only runs while connected + streaming.
-    private func kickMeter() async {
-        guard isLiveViewOn, let p = properties else { return }
-        await withLVPriority {
-            try? await p.setString("eosremoterelease", value: "Press Half")
-            try? await Task.sleep(nanoseconds: 120_000_000)
-            try? await p.setString("eosremoterelease", value: "Release Half")
-        }
-    }
-
-    /// If we're showing a transient property-write error but the camera is
-    /// otherwise healthy (still autodetecting / responding), clear the error
-    /// so a subsequent successful write doesn't leave a stale message in the
-    /// UI. We only clear .error → .ready; never touch .streaming/.disconnected.
-    private func clearTransientErrorIfStreamingReady() {
-        if case .error = ui {
-            ui = .ready
-        }
+        appLog.info("transient error cleared: ui → \(String(describing: self.ui), privacy: .public) (stream active \(streamActive, privacy: .public))")
     }
 
     private func refreshSnapshot() async {
@@ -1214,8 +1902,31 @@ final class AppModel: ObservableObject {
         if let v = snap.mode         { s.mode = v }
         if let v = snap.imageFormat  { s.imageFormat = v }
         if let v = snap.battery      { s.battery = v }
-        if let v = snap.meteringMode { s.meteringMode = v }
-        s.cameraDateTime = snap.cameraDateTime ?? s.cameraDateTime
+        if let v = snap.focusMode    { s.focusMode = v }
+        if let camTime = snap.cameraDateTime {
+            s.cameraDateTime = camTime
+            // Also store the camera-vs-host offset: both clocks tick in real
+            // time, so the offset is the stable quantity and the footer
+            // reconstructs `now + offset`.
+            //
+            // Only recompute it from a reading known to be fresh. The ptp2
+            // driver caches this property for the life of the session (zero
+            // advance measured over 12s of wall time), so in the app's one
+            // long-lived session every read after the first returns the
+            // connect-time value. Recomputing from that would make the offset a
+            // second more negative per second: the readout would tick forward,
+            // snap back, and turn red on a correctly synced camera.
+            //
+            // A changed reading proves the value is live. An identical one
+            // means the cache, and the existing offset is the better estimate.
+            // The camera's own clock is accurate to ~1s per day, so an offset
+            // taken once at connect stays trustworthy.
+            let isFresh = camTime != lastRawCameraClock
+            if isFresh {
+                lastRawCameraClock = camTime
+                s.cameraClockOffset = camTime.timeIntervalSince(Date())
+            }
+        }
         self.snapshot = s
         self.snapshotTick &+= 1
         appLog.info("snapshot[\(self.snapshotTick, privacy: .public)]: iso=\(s.iso, privacy: .public) Tv=\(s.shutter, privacy: .public) Av=\(s.aperture, privacy: .public) K=\(s.whiteBalanceKelvin ?? -1, privacy: .public) mode=\(s.mode, privacy: .public) fmt=\(s.imageFormat, privacy: .public) batt=\(s.battery, privacy: .public)")
@@ -1235,15 +1946,18 @@ final class AppModel: ObservableObject {
         self.shutterChoices = cs.shutter
         self.apertureChoices = cs.aperture
         self.imageFormatChoices = cs.imageFormat
-        self.meteringModeChoices = cs.meteringMode
+        self.whiteBalanceChoices = cs.whiteBalance
         appLog.info("choices: iso=\(cs.iso.count, privacy: .public) shutter=\(cs.shutter.count, privacy: .public) aperture=\(cs.aperture.count, privacy: .public) imageFormat=\(cs.imageFormat.count, privacy: .public) meteringMode=\(cs.meteringMode.count, privacy: .public)")
     }
 
-    /// Periodic background refresh, picks up settings the user changes on the camera
-    /// body. Cadence intentionally slow to minimize PTP pressure on the body.
-    /// Post-wedge: when LV is active we DON'T refresh (the LV stream itself shows
-    /// what the body's doing; we don't need redundant property polls). When idle
-    /// we tick every 10s. Was 1s/3s before the wedge incident that needed AC pull.
+    /// Periodic background refresh that picks up settings the user changes on
+    /// the camera body. The cadence is slow to keep PTP pressure on the body
+    /// low. A tick that starts with live view streaming skips the refresh: the
+    /// stream shows what the body is doing, setting changes trigger their own
+    /// refresh, and captureNow refreshes after each successful capture. When
+    /// idle it ticks every 10 s.
+    /// Faster idle polling (1 s, 3 s) is suspected of wedging the body badly
+    /// enough to need a power pull.
     private func startSnapshotRefresh() {
         snapshotRefreshTask?.cancel()
         snapshotRefreshTask = Task { [weak self] in
@@ -1251,12 +1965,6 @@ final class AppModel: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 let isStreaming = await MainActor.run { self.ui == .streaming }
-                // Skip refresh entirely while LV is streaming, the body has
-                // enough load just feeding 30 FPS preview. We rely on user
-                // setting changes triggering their own refresh, and on the
-                // post-action refreshSnapshot in captureNow / triggerAutofocus.
-                // Idle cadence 10s (was 3s) so we put zero PTP pressure on a
-                // body that's just sitting there.
                 if isStreaming {
                     try? await Task.sleep(nanoseconds: 5_000_000_000)
                     continue
@@ -1274,11 +1982,10 @@ final class AppModel: ObservableObject {
                 await self.refreshSnapshot()
                 let modeAfter = await MainActor.run { self.snapshot.mode }
                 idleTick &+= 1
-                // Choices change rarely EXCEPT on a mode change, where they
-                // change almost certainly (Av's shutter list is "auto"; M's is
-                // the real ladder). Mode change → reload now; otherwise every
-                // 3rd tick. Deterministic, the old Int.random(0..<4) gate
-                // could starve reloads for minutes on a bad streak.
+                // Choices rarely change except on a mode change, where they
+                // almost always do (Av's shutter list is "auto", M's is the
+                // real ladder). Reload on a mode change, otherwise every third
+                // tick.
                 if modeAfter != modeBefore || idleTick % 3 == 0 {
                     await self.loadChoices()
                 }
@@ -1288,28 +1995,38 @@ final class AppModel: ObservableObject {
 
     // MARK: - Hotkey
 
+    /// Restart the hold-key monitor after a hold-key setting changes (Hold
+    /// Shift to zoom, the hold key, the other-apps switch), so the change
+    /// applies at once. With no session it does nothing, and the next connect
+    /// starts the monitor from the current settings.
+    func applyHoldKeySettings() {
+        guard session != nil else { return }
+        startHotkey()
+    }
+
     private func startHotkey() {
         hotkey?.stop()
         hotkeyTask?.cancel()
         var config = HoldKeyMonitor.Config()
         if AppSettings.shared.zoomUsesShift {
-            // Shift-hold = zoom. Bare modifier → always local;
+            // Shift-hold = zoom. Bare modifier → always local, since
             // a global Shift trigger would zoom while any app is focused.
             config.triggerModifier = .shift
-            config.keyCode = 0x31 // unused for trigger; arrow-gate only
+            config.keyCode = 0x31
             config.globalScope = false
         } else {
             config.keyCode = AppSettings.shared.zoomKeyCode
             config.globalScope = AppSettings.shared.enableGlobalHotkey
         }
+        config.isSuspended = { TextEntryFocus.isActiveFromAnyThread() }
         hotkeyLog.info("starting HoldKeyMonitor (trigger=\(AppSettings.shared.zoomUsesShift ? "Shift" : "key0x\(String(config.keyCode, radix: 16))", privacy: .public), global=\(config.globalScope, privacy: .public))")
         let hk = HoldKeyMonitor(config: config)
-        do {
-            try hk.start()
+        // A global start that fails, usually a permission not granted, falls back
+        // to the in-window monitor with the same key, so the key never goes dead.
+        if let reason = hk.startFallingBackToLocal() {
+            hotkeyLog.error("HoldKeyMonitor global start failed, using the in-window monitor instead: \(String(describing: reason), privacy: .public)")
+        } else {
             hotkeyLog.info("HoldKeyMonitor.start() OK")
-        } catch {
-            hotkeyLog.error("HoldKeyMonitor.start() failed: \(String(describing: error), privacy: .public)")
-            return
         }
         self.hotkey = hk
         hotkeyTask = Task { [weak self] in
@@ -1320,7 +2037,7 @@ final class AppModel: ObservableObject {
     }
 
     /// Local NSEvent monitor that fires capture on the configured capture key
-    /// (default: Return). Only active while a Film Tether window is focused.
+    /// (default: Space). Only active while a Film Tether window is focused.
     private func startCaptureKeyMonitor() {
         if let monitor = captureKeyMonitor {
             NSEvent.removeMonitor(monitor)
@@ -1330,31 +2047,50 @@ final class AppModel: ObservableObject {
         hotkeyLog.info("installing capture-key monitor (keyCode=0x\(String(configured, radix: 16), privacy: .public))")
         captureKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
-            // Verbose: log every keyDown so we can see if the monitor is even firing.
-            hotkeyLog.debug("keyDown: code=0x\(String(event.keyCode, radix: 16), privacy: .public) repeat=\(event.isARepeat, privacy: .public)")
-            if event.isARepeat { return event }
+            // Typing in a text field (Camera, Film, Settings) owns every key:
+            // no capture on Space or Return, no focus steps on , and .
+            if TextEntryFocus.isActive { return event }
             // Manual-focus stepping via keyboard: "," = far, "." = near.
-            // Bare = fine (1), ⌥ = medium (2), ⌃ = coarse (3). ⌘ is left alone
-            // so ⌘, still opens Settings. Only act over live view, and never
-            // while a text field is being edited (Settings typing unaffected).
-            if let chars = event.charactersIgnoringModifiers, chars == "," || chars == "." {
-                if (NSApp.keyWindow?.firstResponder as? NSText) != nil { return event }
-                let mods = event.modifierFlags
-                if mods.contains(.command) { return event }
+            // Bare = medium (2), ⌥ = fine (1), ⌃ = coarse (3). ⌘ is left alone
+            // so ⌘, still opens Settings. Only act over live view. Shift is
+            // not excluded: it holds the momentary punch-in, and stepping
+            // focus while zoomed in is what the zoom is for. The mapping
+            // accepts the shifted < and > forms for that.
+            let mods = event.modifierFlags
+            // Autofocus on "/" (arrives as "?" while Shift holds the punch-in).
+            // One press is one run. Autorepeat is swallowed like the focus keys.
+            if let chars = event.charactersIgnoringModifiers,
+               AppAutofocus.isAutofocusKey(chars, command: mods.contains(.command)) {
+                if event.isARepeat { return nil }
                 guard self.isLiveViewOn else { return event }
-                let near = (chars == ".")
-                let step: CameraProperties.ManualFocusStep
-                if mods.contains(.control)     { step = near ? .nearLarge : .farLarge }
-                else if mods.contains(.option) { step = near ? .nearSmall : .farSmall }
-                else                           { step = near ? .nearTiny  : .farTiny }
+                hotkeyLog.info("autofocus key matched")
+                Task { await self.autofocus() }
+                return nil
+            }
+            if !mods.contains(.command),
+               let chars = event.charactersIgnoringModifiers,
+               let step = CameraProperties.ManualFocusStep.forFocusKey(
+                   chars, option: mods.contains(.option), control: mods.contains(.control)) {
+                // Autorepeat is swallowed, not driven: one press is one pulse
+                // (the motor has a settle time), and letting the repeat fall
+                // through to AppKit would beep for as long as the key is held.
+                if event.isARepeat { return nil }
+                guard self.isLiveViewOn else { return event }
                 hotkeyLog.info("focus key matched, driving \(step.rawValue, privacy: .public)")
                 Task { await self.driveManualFocus(step) }
-                return nil // consume
+                return nil
             }
+            // Escape puts an armed white-balance eyedropper away. Checked
+            // before the capture key, which can itself be set to Escape.
+            if event.keyCode == 0x35, self.isPickingWhiteBalance {
+                if !event.isARepeat { self.toggleWhiteBalancePicker() }
+                return nil
+            }
+            if event.isARepeat { return event }
             if event.keyCode == AppSettings.shared.captureKeyCode {
                 hotkeyLog.info("capture key matched, firing captureNow")
                 Task { await self.captureNow() }
-                return nil // consume
+                return nil
             }
             return event
         }
@@ -1365,21 +2101,18 @@ final class AppModel: ObservableObject {
         switch event {
         case .pressed:
             // Trigger held (Shift by default) → punch in to 5× sensor zoom.
-            // 10× was removed (silently no-ops on this 7D firmware).
-            // Remember where we were so the release restores it: holding Shift
-            // from 100% used to dump you back at Fit.
+            // No 10× step: it silently no-ops on the 7D's firmware.
+            // Remember where we were so the release restores it, or holding
+            // Shift from 100% would drop you back at Fit.
             if !previewZoom.engagesCameraPunchIn { zoomBeforeHold = previewZoom }
             await setPreviewZoom(.fiveX)
         case .released:
             await setPreviewZoom(zoomBeforeHold)
         case .arrow(let direction):
-            // Arrow nudge moves the zoom rect by ONE FULL RECT STEP per
-            // press (matches EOS Utility behavior). Now that zoom is
-            // client-side (JPEG crop), the nudge is just a meteringCenter
-            // shift, no body interaction, no calibration headaches.
-            // Step = 0.2 normalized (1/5 of image dimension, matching the
-            // 5x crop rect size). Clamped to [0.1, 0.9] so the rect never
-            // crosses the edge.
+            // An arrow nudge moves the zoom rect by one full rect width per
+            // press (zoomBoxFraction, about 1/5 of the image dimension),
+            // clamped so the rect never crosses the edge. When sensor zoom
+            // is engaged the punch-in follows the box.
             await nudgeMeteringCenter(direction)
         }
     }
@@ -1388,9 +2121,10 @@ final class AppModel: ObservableObject {
         let f = AppModel.zoomBoxFraction
         let step = f                 // one box-width per press
         let lo = f / 2, hi = 1 - f / 2   // keep the box fully inside the frame
-        // The arrow the user pressed is a direction on SCREEN; meteringCenter
-        // lives in sensor space. Map through the rotation so pressing Up always
-        // moves the box up in the preview, whichever way the frame is turned.
+        // The arrow the user pressed is a direction on screen. meteringCenter
+        // lives in sensor space. Map through the mirror and the quarter turn so
+        // pressing Up moves the box up in the preview. Straightening is not
+        // mapped (see sensorDelta).
         let screenDelta: CGVector
         switch direction {
         case .up:    screenDelta = CGVector(dx: 0, dy: -step)
@@ -1398,16 +2132,27 @@ final class AppModel: ObservableObject {
         case .left:  screenDelta = CGVector(dx: -step, dy: 0)
         case .right: screenDelta = CGVector(dx: step, dy: 0)
         }
-        let d = previewRotation.sensorDelta(fromDisplay: screenDelta)
-        var c = meteringCenter
+        let d = sensorDelta(fromDisplay: screenDelta)
+        // Step from where the box is drawn, which is the snapped center.
+        var c = AppModel.punchIn.snapped(meteringCenter)
         c.x = min(max(c.x + d.dx, lo), hi)
         c.y = min(max(c.y + d.dy, lo), hi)
+        await applyMeteringCenter(c)
+    }
+
+    /// Put the zoom box back in the middle of the frame. The same thing a
+    /// power cycle does to the body's own window, available on demand.
+    func centerMeteringBox() async {
+        await applyMeteringCenter(CGPoint(x: 0.5, y: 0.5))
+    }
+
+    /// Move the box, and if the real sensor zoom is engaged, move the punch-in
+    /// to the new spot too (the box aims the live magnified region). The
+    /// position is recomputed from the box (bodyZoomPosition).
+    private func applyMeteringCenter(_ c: CGPoint) async {
         meteringCenter = c
-        // If the real sensor zoom is engaged, move the punch-in to the new
-        // spot too (arrows nudge the live magnified region, like EOS Utility).
         if zoomMode != .fit, !zoomFallbackActive, let lz = liveZoom {
-            let (x, y) = bodyZoomTopLeft()
-            self.zoomBodyCenter = (x, y)
+            let (x, y) = bodyZoomPosition()
             await withLVPriority { try? await lz.setZoomPosition(x: x, y: y) }
         }
     }
@@ -1415,11 +2160,11 @@ final class AppModel: ObservableObject {
     private func applyZoom(_ mode: LiveZoom.Mode) async {
         self.zoomMode = mode
         // The goal is a zoom that yields more real pixels from the camera.
-        // PRIMARY path is the body's sensor-crop punch-in (eoszoom), a fresh,
-        // sharp 1024×680 JPEG of a
-        // small sensor region, exactly what EOS Utility does. Client-side
-        // JPEG crop is kept ONLY as an automatic fallback if the body refuses
-        // the write. The box aims the punch-in via eoszoomposition.
+        // The primary path is the body's sensor-crop punch-in (eoszoom), which
+        // streams a sharp 1024×680 JPEG of a small sensor region. The
+        // client-side JPEG crop is an automatic fallback for when the body
+        // refuses the write or there is no LiveZoom. The box aims the
+        // punch-in via eoszoomposition.
         guard let lz = liveZoom else {
             self.zoomFallbackActive = true   // no camera-side path → client crop
             return
@@ -1429,14 +2174,13 @@ final class AppModel: ObservableObject {
             self.zoomFallbackActive = false
             return
         }
-        // .fivex, punch in, THEN move the window to the box. Order matters:
-        // Canon's EVF recenters the zoom window when zoom engages, so a
-        // position written BEFORE eoszoom=5 is discarded (it doesn't zoom to
-        // that spot). Enter magnified mode first, let the body settle,
-        // then set eoszoomposition, and re-assert once, because the recenter
-        // can land just after our first write.
-        let (x, y) = bodyZoomTopLeft()
-        self.zoomBodyCenter = (x, y)
+        // .fivex: punch in, then move the window to the box. Order matters:
+        // About 290 ms after zoom engages, the 7D moves the window back to
+        // its last punch-in spot, so a position written before eoszoom=5 is
+        // lost. Enter magnified mode first, write eoszoomposition at 180 ms,
+        // and write it again at 300 ms, after that move has landed. On the
+        // 7D this lands 10 times out of 10.
+        let (x, y) = bodyZoomPosition()
         let cameraSideOK: Bool = await withLVPriority {
             do {
                 try await lz.setZoom(.fivex)
@@ -1446,34 +2190,21 @@ final class AppModel: ObservableObject {
                 try? await lz.setZoomPosition(x: x, y: y)
                 return true
             } catch {
-                appLog.error("camera-side zoom failed (\(String(describing: error), privacy: .public)); falling back to client crop")
+                appLog.error("camera-side zoom failed (\(String(describing: error), privacy: .public)), falling back to client crop")
                 return false
             }
         }
-        // OK → body now streams the magnified frame; handleFrame passes it
-        // through untouched (sharp). Not OK → handleFrame client-crops.
+        // On success the body streams the magnified frame and handleFrame
+        // skips its crop. On failure handleFrame crops on the host.
         self.zoomFallbackActive = !cameraSideOK
     }
 
-    /// Upper-left corner of the 1/5 punch-in rect in LV-image pixel space,
-    /// derived from the normalized box center. `eoszoomposition` wants the
-    /// top-left, not the center. Clamped so the rect stays inside the frame.
-    private func bodyZoomTopLeft() -> (x: Int, y: Int) {
-        // Desired rect top-left in OUTPUT pixels (the box you see), clamped so
-        // the box stays in frame, then inverted through the measured line
-        // fit_px = origin + eoszoom × slope to get the eoszoomposition value.
-        // Invert the measured camera response: eoszoom = (box - offset) × gain,
-        // clamped to the camera's range. Lands the zoom center on the box across
-        // the reachable area; extreme top/left hit the hardware floor (eoszoom 0).
-        let ex = (meteringCenter.x - AppModel.zoomRespOffset.x) * AppModel.zoomRespGain.x
-        let ey = (meteringCenter.y - AppModel.zoomRespOffset.y) * AppModel.zoomRespGain.y
-        let x = Int(min(max(ex, 0), AppModel.zoomEoszoomMax.x))
-        let y = Int(min(max(ey, 0), AppModel.zoomEoszoomMax.y))
-        return (x, y)
+    /// The eoszoomposition value for the current box: the measured value that
+    /// lands the punch-in on the reachable center nearest the box, which is
+    /// where the box is drawn.
+    private func bodyZoomPosition() -> (x: Int, y: Int) {
+        AppModel.punchIn.position(for: meteringCenter)
     }
-
-    // nudgeZoom REMOVED, body refuses positions past a tight bound and
-    // the EOS-Utility-style arrow stepping never traversed the full frame.
 
     // MARK: - Permissions
 
@@ -1486,30 +2217,15 @@ final class AppModel: ObservableObject {
 
     func requestAccessibility() { Permissions.requestAccessibility(); refreshPermissions() }
     func requestInputMonitoring() { Permissions.requestInputMonitoring(); refreshPermissions() }
-    func openAccessibilityPane() { Permissions.openAccessibilityPane() }
-    func openInputMonitoringPane() { Permissions.openInputMonitoringPane() }
+}
 
-    // MARK: - Re-entry after permission grant or first launch
-
-    func enableGlobalHotkey() async {
-        guard permissionsState.accessibility && permissionsState.inputMonitoring else { return }
-        hotkey?.stop()
-        hotkeyTask?.cancel()
-        var config = HoldKeyMonitor.Config()
-        config.keyCode = 0x31
-        config.globalScope = true
-        let hk = HoldKeyMonitor(config: config)
-        do {
-            try hk.start()
-        } catch {
-            // Permission was revoked between check and start. Leave hotkey nil.
-            return
-        }
-        self.hotkey = hk
-        hotkeyTask = Task { [weak self] in
-            for await event in hk.events {
-                await self?.handleHotkey(event)
-            }
-        }
-    }
+/// The LiveView and session a live-view ladder is working on. Its close
+/// reads the session from off the main actor.
+private final class LiveViewStallBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lv: LiveView?
+    private var sess: CameraSession?
+    init(lv: LiveView?, session: CameraSession?) { self.lv = lv; self.sess = session }
+    var liveView: LiveView? { lock.lock(); defer { lock.unlock() }; return lv }
+    var session: CameraSession? { lock.lock(); defer { lock.unlock() }; return sess }
 }

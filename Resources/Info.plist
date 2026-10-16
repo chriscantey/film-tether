@@ -5,7 +5,7 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleExecutable</key>
-    <string>FilmTether</string>
+    <string>Film Tether</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
@@ -19,9 +19,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.3.0</string>
+    <string>0.4.0</string>
     <key>CFBundleVersion</key>
-    <string>18</string>
+    <string>0</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSPrincipalClass</key>
@@ -31,12 +31,28 @@
     <key>LSUIElement</key>
     <false/>
     <key>NSCameraUsageDescription</key>
-    <string>Film Tether reads live-view frames from your tethered Canon EOS DSLR over USB.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Film Tether does not send Apple events.</string>
+    <string>Film Tether reads live-view frames from your tethered Canon EOS camera over USB.</string>
     <key>NSAccessibilityUsageDescription</key>
-    <string>Optional. Used only when you opt in to the global-scope hold-to-zoom hotkey, so the hotkey works while another app is frontmost.</string>
+    <string>Optional. Used only if you turn on "Use the hold key while another app is in front" in Settings.</string>
+    <!-- Keeps this app's info and debug log lines in the system log store,
+         so Help > Export Log can include them. -->
+    <key>OSLogPreferences</key>
+    <dict>
+        <key>co.wonders.filmtether</key>
+        <dict>
+            <key>DEFAULT-OPTIONS</key>
+            <dict>
+                <key>Level</key>
+                <dict>
+                    <key>Enable</key>
+                    <string>Debug</string>
+                    <key>Persist</key>
+                    <string>Debug</string>
+                </dict>
+            </dict>
+        </dict>
+    </dict>
     <key>NSInputMonitoringUsageDescription</key>
-    <string>Optional. Used only when you opt in to the global-scope hold-to-zoom hotkey, so the hotkey works while another app is frontmost.</string>
+    <string>Optional. Used only if you turn on "Use the hold key while another app is in front" in Settings.</string>
 </dict>
 </plist>

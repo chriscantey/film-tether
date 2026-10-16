@@ -3,7 +3,8 @@ import XCTest
 
 final class JPEGDimensionsTests: XCTestCase {
 
-    /// Minimal synthetic JPEG: SOI + SOF0 with known dimensions + dummy quant table + EOI.
+    /// Minimal synthetic JPEG: SOI, an SOF0 segment with known dimensions, and
+    /// EOI. No quantization or Huffman tables, which the dimension parser never reads.
     private func syntheticJPEG(width: Int, height: Int) -> Data {
         var bytes: [UInt8] = []
         // SOI
@@ -15,7 +16,7 @@ final class JPEGDimensionsTests: XCTestCase {
         // hh hh  (height)
         // ww ww  (width)
         // 03     (3 components)
-        // 01 22 00  02 11 01  03 11 01  (component tables)
+        // 01 22 00  02 11 01  03 11 01  (component specs)
         bytes += [0xFF, 0xC0, 0x00, 0x11, 0x08]
         bytes += [UInt8((height >> 8) & 0xFF), UInt8(height & 0xFF)]
         bytes += [UInt8((width >> 8) & 0xFF), UInt8(width & 0xFF)]

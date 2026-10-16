@@ -45,7 +45,7 @@ final class FilenameTemplateTests: XCTestCase {
     }
 
     func testLiteralExtensionIsCorrectedToCameraExtension() {
-        // Older installs stored a pattern hardcoding ".CR2"; an R5's CR3 must
+        // A stored pattern can hardcode ".CR2", and an R5's CR3 must
         // not be saved under a lying extension.
         let name = CameraCapture.resolveFilename(
             pattern: "IMG_{seq}.CR2", timestamp: Date(), sequence: 3, cameraExtension: "CR3"
@@ -68,7 +68,7 @@ final class FilenameTemplateTests: XCTestCase {
     }
 
     func testLowercaseCameraExtensionIsUppercased() {
-        // Extensions are always saved uppercase, even if the camera reports
+        // Extensions are saved uppercase, even if the camera reports
         // a lowercase filename.
         let name = CameraCapture.resolveFilename(
             pattern: "IMG_{seq}.{ext}", timestamp: Date(), sequence: 3, cameraExtension: "cr3"

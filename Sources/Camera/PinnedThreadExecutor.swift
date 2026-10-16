@@ -3,11 +3,10 @@ import CoreFoundation
 
 /// A `SerialExecutor` that pins all work to a single dedicated `pthread` running a `CFRunLoop`.
 ///
-/// Why this exists: Swift's custom global actor (`CameraActor`) guarantees serial execution but
-/// does NOT guarantee thread affinity, the default executor hops between OS threads at suspension
-/// points. libgphoto2 sits on libusb-1.0 (thread-sensitive sync transfers) and uses `signal()`
-/// masking that is per-thread. Without pinning, "EIO halfway through a 200-frame live-view session"
-/// is the failure mode.
+/// Swift's custom global actor (`CameraActor`) guarantees serial execution but not thread
+/// affinity: the default executor hops between OS threads at suspension points. This executor
+/// keeps the actor's libgphoto2 calls on one thread, so they do not depend on libgphoto2 and
+/// libusb tolerating a session that moves between threads.
 public final class PinnedThreadExecutor: SerialExecutor, @unchecked Sendable {
     private let runLoop: CFRunLoop
     private let thread: Thread
@@ -31,11 +30,10 @@ public final class PinnedThreadExecutor: SerialExecutor, @unchecked Sendable {
 
             barrier.signal()
 
-            // Run forever.
             CFRunLoopRun()
         }
         thread.qualityOfService = .userInteractive
-        thread.stackSize = 1024 * 1024 // 1 MB; libgphoto2 deep call stacks need headroom
+        thread.stackSize = 1024 * 1024 // 1 MB, libgphoto2's deep call stacks need headroom
         thread.start()
 
         barrier.wait()
@@ -57,17 +55,6 @@ public final class PinnedThreadExecutor: SerialExecutor, @unchecked Sendable {
 
     public func asUnownedSerialExecutor() -> UnownedSerialExecutor {
         UnownedSerialExecutor(ordinary: self)
-    }
-
-    /// Returns the Mach thread ID of the pinned thread. Used to verify every
-    /// `gp_camera_*` call observes the same `pthread_self()` across a session.
-    public func currentPinnedThreadID() async -> UInt64 {
-        await withCheckedContinuation { (cont: CheckedContinuation<UInt64, Never>) in
-            CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
-                cont.resume(returning: UInt64(pthread_mach_thread_np(pthread_self())))
-            }
-            CFRunLoopWakeUp(runLoop)
-        }
     }
 }
 

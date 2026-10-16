@@ -4,18 +4,16 @@ import CoreGraphics
 
 final class PixelSamplerTests: XCTestCase {
 
-    /// Four solid quadrants, so a sample's result tells us unambiguously which
-    /// part of the image was read, this is what pins down the y-down,
-    /// top-left-origin convention.
-    ///   top-left red, top-right green, bottom-left blue, bottom-right white
-
-    /// Build the colour in the *same* space the sampler reads through.
+    /// Build the color in the *same* space the sampler reads through.
     /// `CGColor(red:green:blue:alpha:)` is not sRGB, so filling with it and
     /// reading back through sRGB converts and shifts every channel.
     static func srgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> CGColor {
         CGColor(colorSpace: PixelSampler.workingSpace, components: [r, g, b, 1])!
     }
 
+    /// Four solid quadrants, so a sample's result tells us which part of the
+    /// image was read. That pins down the y-down, top-left-origin convention.
+    ///   top-left red, top-right green, bottom-left blue, bottom-right white
     private func makeQuadrantImage(side: Int = 64) throws -> CGImage {
         let ctx = try XCTUnwrap(CGContext(
             data: nil, width: side, height: side,
@@ -59,8 +57,8 @@ final class PixelSamplerTests: XCTestCase {
                     (1, 1, 1))     // bottom-right
     }
 
-    /// A click right on the edge must still return that corner's colour rather
-    /// than running off the image or bleeding in a neighbouring quadrant.
+    /// A click right on the edge must still return that corner's color rather
+    /// than running off the image or bleeding in a neighboring quadrant.
     func testCornerClicksStayInsideTheImage() throws {
         let img = try makeQuadrantImage()
         assertColor(PixelSampler.averageColor(in: img, atNormalized: CGPoint(x: 0, y: 0)),
@@ -70,7 +68,7 @@ final class PixelSamplerTests: XCTestCase {
     }
 
     func testAveragesAcrossThePatchRatherThanReadingOnePixel() throws {
-        // Half red, half black, split down the middle. A patch centred on the
+        // Half red, half black, split down the middle. A patch centered on the
         // seam must come back at roughly half red, which a single-pixel read
         // could never produce.
         let side = 64
@@ -107,8 +105,8 @@ final class PixelSamplerTests: XCTestCase {
         ))
     }
 
-    /// End to end: sampling a cast and neutralising it should return grey.
-    func testSampledCastFeedsGainsThatNeutraliseIt() throws {
+    /// Sampling a cast and neutralizing it should return gray.
+    func testSampledCastFeedsGainsThatNeutralizeIt() throws {
         let side = 32
         let ctx = try XCTUnwrap(CGContext(
             data: nil, width: side, height: side,

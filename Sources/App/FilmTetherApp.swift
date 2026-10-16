@@ -2,8 +2,6 @@ import SwiftUI
 import AppKit
 import os
 
-private let layoutLog = Logger(subsystem: "co.wonders.filmtether", category: "Layout")
-
 @main
 struct FilmTetherApp: App {
     @StateObject private var model: AppModel = {
@@ -11,47 +9,36 @@ struct FilmTetherApp: App {
         return AppModel()
     }()
 
-    // NSApplicationDelegateAdaptor is the Apple-blessed way to hook the AppKit
-    // lifecycle from SwiftUI. Adding the observer in App.init() instead caused
-    // a known @StateObject double-instantiation issue (init-time access of
-    // self.model creates AppModel A; view-mount creates AppModel B; views
-    // observed B but our willTerminate handler held A, snapshot updates
-    // published to B never reached the closure on A, and worse the @StateObject
-    // identity got confused so .environmentObject's view tree didn't observe
-    // the model that actually ran refreshSnapshot).
+    // NSApplicationDelegateAdaptor hooks the AppKit lifecycle from SwiftUI.
+    // An observer added in App.init() would hit a known @StateObject
+    // double-instantiation issue: init-time access of self.model creates one
+    // AppModel and view mount creates another, so the hook and the views
+    // would hold different models.
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         WindowGroup("Film Tether") {
             MainView()
                 .environmentObject(model)
-                // The 3-row layout (2026-07-28) spread the switches over rows
-                // 2 and 3, so the floor is set by row 1's regions again:
-                // 480 + 132 + 480 + dividers/spacing/padding ≈ 1160. 1200
-                // gives that a safety margin; FT_SNAP render at exactly
-                // 1200×820 shows zero clipping and gap-centered dividers.
-                // Height 820 keeps the 3:2 LV area at 600+ vertical pixels
-                // for usable focus checking.
-                .frame(minWidth: 1200, minHeight: 820)
+                .onAppear { AppUpdates.start() }
                 .task {
-                    // Hand the model to the delegate so its applicationWillTerminate
+                    // Hand the model to the delegate so its applicationShouldTerminate
                     // hook can run a clean stop() before the process dies.
                     AppDelegate.activeModel = model
-                    // Window title stays the clean "Film Tether" (set by WindowGroup).
-                    // The build identity now lives in About (App menu → About Film
-                    // Tether) instead of the title bar, shipped builds shouldn't wear
-                    // a dev stamp. Confirm a build via About or `defaults`/PlistBuddy
-                    // on Info.plist BuildStamp.
                     await model.start()
                 }
         }
         .windowStyle(.titleBar)
         .windowResizability(.contentMinSize)
         .commands {
-            // App menu → About Film Tether: shows version + the build stamp that
-            // used to live in the title bar.
             CommandGroup(replacing: .appInfo) {
                 Button("About Film Tether") { FilmTetherApp.showAboutPanel() }
+                // Check for Updates… sits under About. A build with no feed
+                // (a dev build) has no updater and no item.
+                if let updater = AppUpdates.updater {
+                    Divider()
+                    CheckForUpdatesButton(updater: updater)
+                }
             }
             CommandGroup(replacing: .newItem) {
                 Button("Capture") { Task { await model.captureNow() } }
@@ -67,70 +54,118 @@ struct FilmTetherApp: App {
                 }
                 .keyboardShortcut("l", modifiers: [.command])
                 Divider()
-                Button("Sync Camera Clock to Host") {
+                Button("Set Camera Clock to This Mac") {
                     Task { await model.syncCameraClockLocal() }
                 }
-                .help("Push the host's LOCAL wall time to the camera so saved RAW EXIF DateTimeOriginal matches what you see in Finder")
+                .help("Set the camera clock to this Mac's local time, so the capture time in each RAW matches the time Finder shows.")
             }
             // Everything that changes how the preview *looks* belongs in View,
-            // not File. `.toolbar` is the placement that lands there; the View
+            // not File. `.toolbar` is the placement that lands there. The View
             // menu is otherwise empty, and an empty menu on macOS opens and
-            // instantly closes again, which is what made it look broken.
+            // instantly closes again, which looks broken.
             CommandGroup(replacing: .toolbar) {
-                Button(model.showMeteringOverlay ? "Hide Zoom-Area Overlay" : "Show Zoom-Area Overlay") {
+                Button(model.showMeteringOverlay ? "Hide Zoom Box" : "Show Zoom Box") {
                     model.showMeteringOverlay.toggle()
                 }
-                .help("Toggle the rectangle showing where Shift-zoom will punch into. (Cmd-H removed because it conflicts with macOS's Hide Window.)")
+                .help("Show or hide the box that marks where the Shift zoom looks.")
                 Button("Rotate Preview Right (now \(model.previewRotation.displayName))") {
                     model.rotatePreviewRight()
                 }
                 .keyboardShortcut("r", modifiers: [.command])
-                .help("Turn the live preview 90° clockwise. Cmd-R. Display only, and remembered across launches — the camera and the saved files are never rotated.")
+                .help("Turn the live preview 90° clockwise. Cmd-R. Remembered across launches. The camera and the RAW are never rotated. The rotation is saved in the capture's metadata, so an app that reads it can turn the picture the same way.")
                 Button("Rotate Preview Left") {
                     model.rotatePreviewLeft()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .help("Turn the live preview 90° counter-clockwise. Cmd-Shift-R.")
+                Button(model.previewMirrored
+                       ? "Un-Mirror Preview" : "Mirror Preview (Flip Horizontally)") {
+                    model.toggleMirror()
+                }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .help("Flip the preview left to right, for film sitting emulsion side up in the holder. Cmd-Shift-M. Remembered across launches. A vertical flip is this plus two Rotate Rights. The RAW's image data is untouched. The flip is saved in the capture's metadata.")
                 Divider()
-                Button(model.previewAdjustments.invert
+                Button(model.displayedAdjustments.invert
                        ? "Show Preview as Negative" : "Show Preview as Positive") {
                     model.toggleInvert()
                 }
                 .keyboardShortcut("i", modifiers: [.command])
-                .help("Invert the preview so a negative shows as the positive image. Cmd-I. Display only — the captured RAW is still the negative.")
+                .help("Invert the preview so a negative shows as the positive image. Cmd-I. The captured RAW is still the negative. The setting is saved in the capture's metadata.")
                 Button(model.previewAdjustments.monochrome
                        ? "Show Preview in Color" : "Show Preview in Black & White") {
                     model.toggleMonochrome()
                 }
                 .keyboardShortcut("b", modifiers: [.command])
-                .help("Raw pixels off a B&W negative carry no useful colour. Cmd-B. Display only — the saved files are untouched.")
+                .help("Switch the preview between black and white and color. Raw pixels off a black and white negative carry no useful color. Cmd-B. The camera and the RAW's image data are untouched. The setting is saved in the capture's metadata.")
                 Button(model.isPickingWhiteBalance
                        ? "Cancel White Balance Pick" : "Pick White Balance from Preview…") {
                     model.toggleWhiteBalancePicker()
                 }
                 .disabled(!model.canPickWhiteBalance)
-                .help("Then click the unexposed film base in the preview to neutralise its cast. Unavailable while the preview is inverted, where the base is the darkest part of the picture rather than the brightest.")
+                .help("Choose this, then click the unexposed film base in the preview to neutralize its color cast. If the preview is showing the positive, it shows the negative while you pick and switches back after.")
                 Button("Reset White Balance") {
                     model.resetWhiteBalance()
                 }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
                 .disabled(model.previewAdjustments.whiteBalance == nil)
-                .help("Go back to the camera's as-shot colour. Cmd-Shift-W.")
+                .help("Go back to the camera's as-shot color. Cmd-Shift-W.")
+                Divider()
+                Button("Auto-Crop") { model.runAutoCrop() }
+                    .disabled(!model.isLiveViewOn || model.previewZoom != .fit)
+                    .help("Find the negative under the lens and put an adjustable crop box on it. It runs only when you ask, so it never jumps around while you're still positioning the film.")
+                // Cmd-K, not a bare Return. A menu item's key equivalent is
+                // dispatched before the responder chain, so a bare Return here
+                // would be swallowed from the Camera and Film fields on row 3,
+                // where Return commits a value into its history, for as long
+                // as a crop exists. Cmd-Return is already Capture, and
+                // colliding with it would make fixing a crop fire the shutter
+                // or vice versa.
+                Button(model.isCropEditing ? "Fix Crop in Place" : "Adjust Crop") {
+                    model.toggleCropEditing()
+                }
+                .keyboardShortcut("k", modifiers: [.command])
+                .disabled(!model.isCropActive)
+                .help("Fixing the crop leaves a hairline outline and stops the overlay taking the pointer, so click-to-move and the eyedropper underneath it work again. Cmd-K.")
+                Button("Center Crop") { model.centerCrop() }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
+                    .disabled(!model.isCropActive)
+                    .help("Slide the crop box to the middle of the frame, same size. Cmd-Shift-K.")
+                Button("Center Zoom Box") { Task { await model.centerMeteringBox() } }
+                    .keyboardShortcut("0", modifiers: [.command, .shift])
+                    .disabled(!model.isLiveViewOn)
+                    .help("Put the zoom box back in the middle of the frame. If the 500% view is on, it follows. Cmd-Shift-0.")
+                Button("Clear Crop") { model.clearCrop() }
+                    .keyboardShortcut(.delete, modifiers: [.command])
+                    .disabled(!model.isCropActive)
+                    .help("Remove the crop entirely. Cmd-Delete.")
+                Button("Clear Straightening") { model.resetStraightening() }
+                    .disabled(!model.isStraightened)
+                    .help("Undo the straightening the crop box's rotate band applied, leaving the quarter-turn rotation alone. An unstraightened preview is pixel exact. A straightened one is resampled.")
                 Divider()
                 Button(model.focusPeakingEnabled ? "Disable Focus Peaking" : "Enable Focus Peaking") {
                     model.focusPeakingEnabled.toggle()
                 }
                 .keyboardShortcut("p", modifiers: [.command])
-                .help("Overlay highlights on in-focus edges (host-side CoreImage filter). Cmd-P.")
-                Button("Cycle Peaking Color (currently \(model.focusPeakingColor.rawValue))") {
+                .help("Highlight the parts of the preview that are in focus. Cmd-P.")
+                Button("Cycle Peaking Color (currently \(model.focusPeakingColor.displayName))") {
                     model.cycleFocusPeakingColor()
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
-                .help("Cycle through cyan / magenta / yellow / white / lime. Cmd-Shift-P. Useful if the current color blends into the scene.")
+                .help("Step through the eight peaking colors. Cmd-Shift-P. Handy when the current one blends into the picture.")
             }
             // There is no sidebar. Left alone, SwiftUI's "Toggle Sidebar" lands
             // in the Help menu of all places, where it does nothing.
             CommandGroup(replacing: .sidebar) { }
+            // Help > Film Tether Help opens the write-up on GitHub. Left alone,
+            // macOS shows "Help isn't available for Film Tether".
+            CommandGroup(replacing: .help) {
+                Button("Film Tether Help") { NSWorkspace.shared.open(AppInfo.helpURL) }
+            }
+            // Help > Export Log…, so a problem report can carry the log as a file.
+            CommandGroup(after: .help) {
+                Button("Export Log…") { LogExport.run() }
+                    .help("Save the last 24 hours of Film Tether's log to a file, to send with a problem report.")
+            }
         }
 
         Settings {
@@ -141,14 +176,11 @@ struct FilmTetherApp: App {
 
     /// Standard macOS About panel, populated with the marketing version
     /// (Info.plist CFBundleShortVersionString) and the injected build stamp
-    /// (git short hash + bundle time). This is where the build identity lives
-    /// now that the title bar is clean for shipped builds.
+    /// (git short hash and bundle time).
     static func showAboutPanel() {
         let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
-        // Contributors are LINKED rather than listed. A hardcoded name list in
-        // the binary goes stale the moment someone new lands work, and keeping
-        // it current would mean a code change, a rebuild and a re-sign for
-        // something the repo already tracks for free.
+        // Contributors are linked rather than listed, because a name list
+        // compiled into the binary goes stale when someone new lands work.
         let body: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11),
             .foregroundColor: NSColor.secondaryLabelColor,
@@ -164,10 +196,24 @@ struct FilmTetherApp: App {
                 .link: URL(string: "https://github.com/chriscantey/film-tether#contributors")!,
             ]))
         credits.append(NSAttributedString(
-            string: ", and huge thanks to them.\n\n"
-                  + "Built on libgphoto2 (LGPL 2.1 or later), part of the gPhoto project, "
-                  + "along with the libraries it bundles (libusb, libexif, jpeg-turbo, and gd). "
-                  + "Thanks to their maintainers.",
+            string: ", and huge thanks to them. The cameras it works with are listed under ",
+            attributes: body))
+        credits.append(NSAttributedString(
+            string: "Supported cameras",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .link: AppInfo.supportedCamerasURL,
+            ]))
+        credits.append(NSAttributedString(
+            string: ".\n\n"
+                  + "Built on libgphoto2, part of the gPhoto project, and on libusb, "
+                  + "libexif, libintl from GNU gettext and libltdl from GNU Libtool, all "
+                  + "under the GNU LGPL, and on libjpeg-turbo. This software is based in "
+                  + "part on the work of the Independent JPEG Group. The license texts "
+                  + "and notices are inside the app in Contents/Resources/Licenses, and "
+                  + "RELINKING.md in the repository explains how to replace these "
+                  + "libraries with your own builds. Thanks to their maintainers.\n\n"
+                  + AppUpdates.aboutSentence,
             attributes: body))
         NSApplication.shared.orderFrontStandardAboutPanel(options: [
             .applicationName: "Film Tether",
@@ -178,97 +224,29 @@ struct FilmTetherApp: App {
     }
 }
 
-/// AppKit delegate so we can hook the standard `applicationWillTerminate` path
-/// for clean libgphoto2 shutdown. Without this the process gets SIGKILL'd by
-/// Cmd-Q, libgphoto2 never calls gp_camera_exit, and the body's PTP session
-/// stays wedged for the next launch (this produces -10 timeout chains until
-/// the body is power-cycled the hard way).
+/// AppKit delegate that hooks the standard `applicationShouldTerminate` path
+/// for a clean libgphoto2 shutdown. Without it, Cmd-Q exits the process
+/// without ever running model.stop(), so gp_camera_exit is never called and
+/// the body's PTP session stays wedged for the next launch (-10 timeout
+/// chains until the body is power-cycled).
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set from FilmTetherApp.body.task once SwiftUI has finished mounting the
-    /// @StateObject AppModel. Reading it before that point is a programming
-    /// error (and a no-op via the optional unwrap below).
+    /// @StateObject AppModel. Until then it is nil, and
+    /// applicationShouldTerminate quits without stopping the camera.
     static var activeModel: AppModel?
 
-    /// Reports the window minimum the layout actually ended up enforcing.
-    /// The toolbar's minimum width is derived from its compact layout rather
-    /// than hardcoded, so this is the only way to see the real number, and it
-    /// makes a regression (a control becoming reachable-but-clipped) visible
-    /// instead of silent. Debug builds only via EOS_DEBUG; stream with:
-    ///   log stream --predicate 'subsystem == "co.wonders.filmtether"' --info
     func applicationDidFinishLaunching(_ notification: Notification) {
         MenuBarTidy.install()
-
-        guard ProcessInfo.processInfo.environment["EOS_DEBUG"] == "1" else { return }
-
-        // Re-dump on every menu-bar click. The launch dump below misses anything
-        // AppKit only inserts while a menu is tracking, so opening a menu once
-        // is what produces the trustworthy report.
-        MenuBarTidy.onTidied = { Self.dumpMenus(reason: "menu opened") }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-            var report = ""
-            for w in NSApp.windows where w.isVisible {
-                let line = "window frame=\(NSStringFromRect(w.frame)) minSize=\(NSStringFromSize(w.minSize)) contentMinSize=\(NSStringFromSize(w.contentMinSize))"
-                layoutLog.info("\(line, privacy: .public)")
-                report += line + "\n"
-            }
-            // Also to a file: a GUI app has no useful stderr, and unified
-            // logging isn't always readable from a sandboxed shell.
-            let path = NSTemporaryDirectory() + "filmtether-layout.txt"
-            try? report.write(toFile: path, atomically: true, encoding: .utf8)
-
-            Self.dumpMenus(reason: "launch")
-        }
     }
 
-    /// Dump the finished menu bar.
-    ///
-    /// SwiftUI's `commands` builder describes what to *add*; what AppKit ends up
-    /// with is the merge of that with the standard menus, and the two are not
-    /// easy to predict, an empty menu or a trailing separator is invisible in
-    /// the source and obvious here. Marks the problems rather than making you
-    /// spot them: a menu with no enabled items opens and instantly closes, and a
-    /// separator at the top or bottom draws as blank space.
-    static func dumpMenus(reason: String) {
-        let menus = "MENU BAR (\(reason))\n" + describeMenus()
-        layoutLog.info("\(menus, privacy: .public)")
-        try? menus.write(toFile: NSTemporaryDirectory() + "filmtether-menus.txt",
-                         atomically: true, encoding: .utf8)
-    }
-
-    static func describeMenus() -> String {
-        var out = ""
-        for item in NSApp.mainMenu?.items ?? [] {
-            guard let menu = item.submenu else { continue }
-            let real = menu.items.filter { !$0.isSeparatorItem }
-            var notes: [String] = []
-            if real.isEmpty { notes.append("EMPTY — opens then closes") }
-            if menu.items.first?.isSeparatorItem == true { notes.append("leading separator") }
-            if menu.items.last?.isSeparatorItem == true { notes.append("TRAILING separator — blank space at the bottom") }
-            out += "\n\(item.title)  [\(real.count) items]"
-            out += notes.isEmpty ? "\n" : "  ⚠️ \(notes.joined(separator: "; "))\n"
-            for (i, sub) in menu.items.enumerated() {
-                if sub.isSeparatorItem {
-                    let doubled = i > 0 && menu.items[i - 1].isSeparatorItem
-                    out += "    ---------\(doubled ? "  ⚠️ doubled" : "")\n"
-                } else {
-                    // Alternates flagged: they are hidden until a modifier is
-                    // held, so an unexpected one is invisible in a plain listing
-                    // and is exactly the kind of thing that draws as a blank row.
-                    out += "    \(sub.title)\(sub.submenu != nil ? " ▸" : "")\(sub.isAlternate ? "  (alt)" : "")\n"
-                }
-            }
-        }
-        return out
-    }
-
-    /// Async-clean shutdown. We CANNOT use applicationWillTerminate +
-    /// DispatchGroup.wait: that blocks the main thread, but model.stop() is
-    /// @MainActor and needs that exact thread, a self-deadlock that left the
-    /// camera in live view (mirror up → wedged) and made quit hang the full
-    /// timeout. applicationShouldTerminate + .terminateLater lets the run loop
-    /// keep turning while stop() actually runs (dropping EVF + gp_camera_exit),
-    /// then we reply to let the app die. A safety timer force-quits if stop()
-    /// ever hangs on a sluggish body.
+    /// Async-clean shutdown. applicationWillTerminate with DispatchGroup.wait
+    /// cannot work: it blocks the main thread, and model.stop() is @MainActor
+    /// and needs that thread. The self-deadlock leaves the camera in live view
+    /// (mirror up, wedged) and makes quit hang the full timeout.
+    /// applicationShouldTerminate with .terminateLater lets the run loop keep
+    /// turning while stop() runs (dropping EVF, then gp_camera_exit), and the
+    /// reply then lets the app exit. A safety timer force-quits if stop()
+    /// hangs on a sluggish body.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model = AppDelegate.activeModel else { return .terminateNow }
         Task { @MainActor in

@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# bootstrap.sh, first-time Mac setup for Film Tether.
-# Run this once after cloning. For everyday iterate use `make` directly.
+# bootstrap.sh: first-time Mac setup for Film Tether.
+# Run this once after cloning. For everyday work, use `make` directly.
 #
 # Usage:
-#   cd FilmTether
+#   cd film-tether
 #   ./scripts/bootstrap.sh
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "Film Tether, Mac bootstrap"
+echo "Film Tether: Mac bootstrap"
 echo "===================================="
 
-# 1. Xcode Command Line Tools
 echo ">> Checking Xcode CLT..."
 if ! xcode-select -p >/dev/null 2>&1; then
     echo "   NOT INSTALLED."
@@ -23,7 +22,6 @@ if ! xcode-select -p >/dev/null 2>&1; then
 fi
 echo "   OK: $(xcode-select -p)"
 
-# 2. Homebrew
 echo ">> Checking Homebrew..."
 if ! command -v brew >/dev/null 2>&1; then
     echo "   NOT INSTALLED."
@@ -32,14 +30,12 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 echo "   OK: $(brew --prefix)"
 
-# Make sure brew's bin is on PATH for the rest of this script
 export PATH="$(brew --prefix)/bin:$PATH"
 export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
-# 3. Brewfile dependencies
 echo ">> Checking Brewfile dependencies..."
 if [ ! -f Brewfile ]; then
-    echo "   Brewfile not found, are you in the project root?"
+    echo "   Brewfile not found. Are you in the project root?"
     exit 1
 fi
 if ! brew bundle check >/dev/null 2>&1; then
@@ -49,7 +45,6 @@ else
     echo "   OK: all Brewfile dependencies satisfied"
 fi
 
-# 4. Verify pkg-config can resolve libgphoto2
 echo ">> Verifying libgphoto2 via pkg-config..."
 if ! pkg-config --cflags libgphoto2 >/dev/null 2>&1; then
     echo "   pkg-config can't find libgphoto2."
@@ -58,7 +53,6 @@ if ! pkg-config --cflags libgphoto2 >/dev/null 2>&1; then
 fi
 echo "   OK: $(pkg-config --modversion libgphoto2)"
 
-# 5. Swift toolchain
 echo ">> Checking Swift toolchain..."
 if ! command -v swift >/dev/null 2>&1; then
     echo "   swift not on PATH. Did Xcode CLT install correctly?"
@@ -66,7 +60,6 @@ if ! command -v swift >/dev/null 2>&1; then
 fi
 echo "   OK: $(swift --version | head -1)"
 
-# 6. Build + bundle + launch
 echo
 echo ">> Building (release, arm64)..."
 make build
@@ -74,7 +67,7 @@ echo
 echo ">> Bundling .app..."
 make bundle
 echo
-echo ">> Launching FilmTether.app..."
+echo ">> Launching Film Tether.app..."
 make run
 
 cat <<'EOF'

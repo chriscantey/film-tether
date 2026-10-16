@@ -1,7 +1,7 @@
 import Foundation
 import CoreGraphics
 
-/// Reads colour back out of a decoded frame, for the click-to-set-white-balance
+/// Reads color back out of a decoded frame, for the click-to-set-white-balance
 /// eyedropper.
 public enum PixelSampler {
 
@@ -14,20 +14,20 @@ public enum PixelSampler {
         ?? CGColorSpaceCreateDeviceRGB()
 
     /// Default eyedropper patch, in pixels on a side. A single pixel off a film
-    /// scan is mostly grain and sensor noise; averaging a small square is what
+    /// scan is mostly grain and sensor noise. Averaging a small square is what
     /// makes repeated clicks on the same film base agree with each other.
     public static let defaultPatchSize = 9
 
-    /// Average colour of a square patch centred on `point`, as 0...1 channels.
+    /// Average color of a square patch centered on `point`, as 0...1 channels.
     ///
-    /// `point` is normalized [0,1]² and **y-down**, in the image's own
-    /// orientation, callers holding a rotated preview must un-rotate first, so
-    /// the sample comes from the pixel the user actually clicked.
+    /// `point` is normalized [0,1]² and y-down, in the image's own
+    /// orientation. Callers holding a rotated preview must un-rotate first, so
+    /// the sample comes from the pixel the user clicked.
     ///
     /// Values are read in the image's encoded (gamma) space rather than being
-    /// linearised. That's deliberate: the correction computed from these numbers
-    /// is applied by a colour matrix running in the same unmanaged space, so
-    /// sampling and applying agree and one click lands neutral. Linearising here
+    /// linearized. That's deliberate: the correction computed from these numbers
+    /// is applied by a color matrix running in the same unmanaged space, so
+    /// sampling and applying agree and one click lands neutral. Linearizing here
     /// and not there would leave a residual cast.
     ///
     /// Returns nil if the image is empty or the patch can't be rendered.
@@ -39,7 +39,7 @@ public enum PixelSampler {
         let w = image.width, h = image.height
         guard w > 0, h > 0, patchSize > 0 else { return nil }
 
-        // Centre pixel, clamped so a click on the very edge still samples a
+        // Center pixel, clamped so a click on the very edge still samples a
         // full patch's worth of real pixels rather than falling off the image.
         let cx = Int((point.x * CGFloat(w)).rounded(.down))
         let cy = Int((point.y * CGFloat(h)).rounded(.down))

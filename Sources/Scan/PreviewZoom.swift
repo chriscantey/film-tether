@@ -3,17 +3,17 @@ import CoreGraphics
 
 /// How the live preview is scaled on screen.
 ///
-/// The three states are expressed as magnification **relative to viewing the
-/// whole frame at 1:1**, which is what a scanning operator actually cares about:
+/// The three states are expressed as magnification relative to viewing the
+/// whole frame at 1:1, which is what a scanning operator cares about:
 ///
-///   • `.fit`   , the whole frame, scaled to the pane. The percentage varies
-///                 with window size and rotation, so it's computed live rather
-///                 than baked into the case.
-///   • `.actual`, 100%, one frame pixel per point. Bigger than fit on a normal
-///                 window, and the honest "no scaling applied" reference.
-///   • `.fiveX` , 500%, which is the camera's own sensor punch-in rather than
-///                 an upscale of the preview JPEG, so it shows real detail. This
-///                 is the focus-check view.
+/// - `.fit`: the whole frame, scaled to the pane. The percentage varies with
+///   window size and rotation, so it's computed live rather than baked into
+///   the case.
+/// - `.actual`: 100%, one frame pixel per point. Bigger than fit on a normal
+///   window, and the true "no scaling applied" reference.
+/// - `.fiveX`: 500%, which is the camera's own sensor punch-in rather than an
+///   upscale of the preview JPEG, so it shows real detail. This is the
+///   focus-check view.
 public enum PreviewZoom: String, CaseIterable, Codable, Sendable {
     case fit
     case actual
@@ -32,18 +32,9 @@ public enum PreviewZoom: String, CaseIterable, Codable, Sendable {
     /// The other two are host-side scaling of a full-frame preview.
     public var engagesCameraPunchIn: Bool { self == .fiveX }
 
-    /// Fixed magnification, or nil for `.fit` whose scale depends on geometry.
-    public var fixedPercent: Int? {
-        switch self {
-        case .fit:    return nil
-        case .actual: return 100
-        case .fiveX:  return 500
-        }
-    }
-
     /// Button/menu label. `.fit` folds in the live percentage when one is
-    /// available, it isn't while live view is off and there's no frame to
-    /// measure, in which case the bare word is shown.
+    /// available. While live view is off there's no frame to measure, and the
+    /// bare word is shown.
     public func label(fitPercent: Int?) -> String {
         switch self {
         case .fit:
@@ -56,7 +47,7 @@ public enum PreviewZoom: String, CaseIterable, Codable, Sendable {
 
     /// Percentage at which a frame of `frame` points fits inside `pane` points.
     ///
-    /// `frame` is the frame **as displayed**, i.e. already rotated, so rotating
+    /// `frame` is the frame as displayed, i.e. already rotated, so rotating
     /// the preview naturally recomputes this: a 3:2 frame in a landscape pane
     /// fits at a very different scale than the same frame turned on its side.
     ///

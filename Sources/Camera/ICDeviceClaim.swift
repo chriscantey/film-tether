@@ -1,9 +1,9 @@
 import Foundation
 import ImageCaptureCore
 
-/// Releases macOS's PTP claim on the Canon EOS 7D so libgphoto2 can take over.
+/// Releases macOS's PTP claim on a Canon EOS body so libgphoto2 can take over.
 ///
-/// macOS auto-launches `PTPCamera` helper + ImageCaptureCore via `ICDeviceBrowser` on hotplug.
+/// macOS launches its PTP camera helper on hotplug, and the helper claims the body.
 /// Symptom if not released: `gp_camera_init` returns `GP_ERROR_IO_USB_CLAIM (-53)` or live view
 /// stalls after 1-2 frames.
 public final class ICDeviceClaim: NSObject, @unchecked Sendable, ICDeviceBrowserDelegate {
@@ -12,7 +12,6 @@ public final class ICDeviceClaim: NSObject, @unchecked Sendable, ICDeviceBrowser
 
     private let browser = ICDeviceBrowser()
     private var matchedDevices: [ICCameraDevice] = []
-    private var completionHandlers: [() -> Void] = []
 
     override private init() {
         super.init()
@@ -20,9 +19,9 @@ public final class ICDeviceClaim: NSObject, @unchecked Sendable, ICDeviceBrowser
         browser.browsedDeviceTypeMask = .camera
     }
 
-    /// Release any macOS-side claim on a Canon EOS DSLR (any product). Returns after the
-    /// browser has had a chance to enumerate (up to ~2s) and requestEject
-    /// has been called on any matches.
+    /// Release any macOS-side claim on an attached Canon camera. Takes about
+    /// 2 s: 1.5 s for the browser to enumerate, requestEject on any matches,
+    /// then 0.5 s to settle.
     public static func releaseCanonEos() async {
         let claim = ICDeviceClaim()
         await claim.releaseInternal()
@@ -30,12 +29,11 @@ public final class ICDeviceClaim: NSObject, @unchecked Sendable, ICDeviceBrowser
 
     private func releaseInternal() async {
         browser.start()
-        // Give the browser ~1.5s to enumerate; longer waits don't help on cold plug.
+        // Give the browser ~1.5s to enumerate. Longer waits don't help on cold plug.
         try? await Task.sleep(nanoseconds: 1_500_000_000)
         for device in matchedDevices {
-            // requestEject() is the non-deprecated replacement for
-            // requestEjectOrDisconnect() (deprecated macOS 10.15). The modern
-            // overlay bridges it as async throws; best-effort, so try?/await.
+            // requestEject() replaces requestEjectOrDisconnect() (deprecated
+            // macOS 10.15). Best-effort.
             try? await device.requestEject()
         }
         // Allow eject to propagate.
@@ -68,13 +66,12 @@ public final class ICDeviceClaim: NSObject, @unchecked Sendable, ICDeviceBrowser
         }
     }
 
-    /// Belt-and-suspenders fallback: terminate macOS's PTP camera helper processes.
-    /// Safe to call even when no helper is running; absorbs all errors.
+    /// Fallback: terminate macOS's PTP camera helper processes.
+    /// Safe to call even when no helper is running, and absorbs all errors.
     ///
-    /// Naming has changed across macOS versions:
-    ///   - macOS 10.x-13: `PTPCamera`
-    ///   - macOS 14+ (Sonoma/Sequoia/Tahoe): `/usr/libexec/ptpcamerad`
-    /// We try every known name. Each `killall` is a no-op if the process isn't running.
+    /// Older macOS releases run `PTPCamera`, and current ones run
+    /// `/usr/libexec/ptpcamerad` (macOS 13 already does). We try both names.
+    /// Each `killall` is a no-op if the process isn't running.
     public static func killPTPCameraHelper() {
         let candidates = ["ptpcamerad", "PTPCamera"]
         for name in candidates {

@@ -5,7 +5,7 @@ import Foundation
 /// exiftool (Perl), and Apple's ImageIO refuses CR2 as a write destination.
 ///
 /// Strategy: append-only splice. The packet (and, if IFD0 has no XMP tag yet,
-/// a rebuilt copy of IFD0) is APPENDED at end-of-file; the only bytes that
+/// a rebuilt copy of IFD0) is appended at end-of-file. The only bytes that
 /// change inside the original extent are a single pointer patch:
 ///   - XMP tag (700) already present: that entry's count+offset fields (8 bytes)
 ///   - XMP tag absent: the header's IFD0 pointer (4 bytes at offset 4), which
@@ -13,10 +13,10 @@ import Foundation
 /// Every other structure (EXIF, MakerNotes, sensor strips, embedded JPEGs)
 /// keeps its exact offset, which is what makes this safe where naive TIFF
 /// rewriting is not: Canon MakerNotes contain absolute file offsets that break
-/// if anything shifts. Nothing shifts here, ever.
+/// if anything shifts.
 ///
 /// The dead bytes left behind (the old IFD0 or old packet) are unreferenced
-/// and harmless; repeated re-embeds grow the file by the packet size only.
+/// and harmless. Repeated re-embeds grow the file by the packet size only.
 ///
 /// Scope gate: little-endian classic TIFF only (every CR2 is II/42). Anything
 /// else, big-endian, BigTIFF, CR3/ISO-BMFF, throws `.unsupportedContainer`
@@ -66,7 +66,7 @@ public enum XMPEmbedder {
 
     /// Returns a new Data with `packet` embedded as IFD0 tag 700. The input is
     /// never mutated. Throws on non-CR2-shaped containers and on any internal
-    /// verification failure, the caller keeps the original file untouched.
+    /// verification failure, and the caller keeps the original file untouched.
     public static func embed(packet: String, into original: Data) throws -> Data {
         guard original.count >= 16 else { throw EmbedError.malformed("file too small") }
         guard original[original.startIndex] == 0x49, original[original.startIndex + 1] == 0x49 else {
@@ -107,13 +107,13 @@ public enum XMPEmbedder {
 
         if let e = existingEntryOffset {
             // Re-aim the existing entry at the appended packet: 8 bytes patched
-            // (count at e+4, value offset at e+8). Type byte left as-is, both
-            // BYTE(1) and UNDEFINED(7) are seen in the wild and readers accept
-            // either; not touching it keeps the diff minimal.
+            // (count at e+4, value offset at e+8). The type field is left as
+            // is. BYTE (1) and UNDEFINED (7) are both seen in the wild and
+            // readers accept either.
             putU32(&out, e + 4, UInt32(packetBytes.count))
             putU32(&out, e + 8, packetOffset)
         } else {
-            // Rebuild IFD0 with one extra entry, appended at EOF; patch the
+            // Rebuild IFD0 with one extra entry, appended at EOF, and patch the
             // header's IFD0 pointer. Original IFD0 becomes dead space. Entries
             // are copied verbatim, their value offsets are absolute and still
             // valid because nothing moved.
@@ -143,9 +143,11 @@ public enum XMPEmbedder {
 
     // MARK: - Verification
 
-    /// Re-parse the spliced file and prove (a) the packet reads back
-    /// byte-identical via the normal IFD walk, and (b) no byte of the original
-    /// extent changed except the sanctioned pointer patch.
+    /// Re-parse the spliced file and check (a) the packet reads back
+    /// byte-identical via the normal IFD walk, and (b) at most 8 bytes of the
+    /// original extent changed, all within one 8-byte span, either inside the header's IFD0
+    /// pointer (offsets 4 to 7) or past the header. The check does not confirm
+    /// that bytes past the header are the XMP entry's count and offset.
     private static func verify(_ out: Data, against original: Data, expectPacket: Data) throws {
         let ifd0 = Int(try u32(out, 4))
         let n = Int(try u16(out, ifd0))
@@ -163,16 +165,17 @@ public enum XMPEmbedder {
         guard found == expectPacket else { throw EmbedError.verifyFailed("packet read-back mismatch") }
 
         // Diff audit over the original extent: collect every changed offset and
-        // require the set to be within one sanctioned patch region.
+        // require a span of at most 8 bytes, all in the header pointer or all
+        // past the header.
         var changed: [Int] = []
         for i in 0..<original.count where out[out.startIndex + i] != original[original.startIndex + i] {
             changed.append(i)
             if changed.count > 8 { throw EmbedError.verifyFailed("more than 8 bytes changed in original extent") }
         }
-        if changed.isEmpty { throw EmbedError.verifyFailed("no pointer patch found — packet unreachable") }
+        if changed.isEmpty { throw EmbedError.verifyFailed("no pointer patch found, packet unreachable") }
         let span = changed.min()!...changed.max()!
         let headerPatch = 4...7
-        let entryPatchOK = changed.allSatisfy { $0 >= 8 }  // any 8-byte window fully outside the header
+        let entryPatchOK = changed.allSatisfy { $0 >= 8 }  // all past the header
         guard span.count <= 8, (changed.allSatisfy { headerPatch.contains($0) } || entryPatchOK) else {
             throw EmbedError.verifyFailed("changed bytes outside sanctioned patch region: \(changed)")
         }
@@ -181,7 +184,7 @@ public enum XMPEmbedder {
     // MARK: - File-level embed (copy → splice → atomic swap)
 
     /// Embed into the file at `url` safely: splice in memory, write to a temp
-    /// file in the SAME directory, then atomically replace. On any error the
+    /// file in the same directory, then atomically replace. On any error the
     /// original file is untouched.
     public static func embedFile(packet: String, at url: URL) throws {
         let original = try Data(contentsOf: url)

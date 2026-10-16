@@ -1,7 +1,7 @@
 import Foundation
 import CGPhoto2
 
-public enum CameraError: Error, LocalizedError {
+public enum CameraError: Error, LocalizedError, Equatable {
     case libGPhoto(code: Int32, message: String)
     case cameraNotFound
     case usbClaimDenied(underlying: Int32)
@@ -15,6 +15,17 @@ public enum CameraError: Error, LocalizedError {
     case captureFailed(reason: String)
     case sessionAlreadyOpen
     case sessionNotOpen
+    /// Something that was not a CameraError reached a path that reports one
+    /// (the connection state carries the error itself).
+    case unexpected(String)
+    /// A budgeted call (the first config read after init, or the live-view
+    /// start) ran out its stall ladder (StallLadder.swift). `stage` names the
+    /// call.
+    case notAnswering(stage: String)
+    /// The same, in the first session after a camera power cycle that itself
+    /// followed a stall: the one signature where restarting the Mac is the
+    /// advice (StallHistory).
+    case notAnsweringAfterPowerCycle(stage: String)
 
     public var errorDescription: String? {
         switch self {
@@ -45,6 +56,12 @@ public enum CameraError: Error, LocalizedError {
             return "Camera session is already open."
         case .sessionNotOpen:
             return "Camera session is not open."
+        case .unexpected(let text):
+            return text
+        case .notAnswering(let stage):
+            return "No answer to the \(stage) in time."
+        case .notAnsweringAfterPowerCycle(let stage):
+            return "No answer to the \(stage) in time, again, in the first session after the camera was power cycled following a stall."
         }
     }
 
@@ -62,7 +79,6 @@ public enum CameraError: Error, LocalizedError {
         return .libGPhoto(code: rc, message: message)
     }
 
-    /// Throws if `rc != GP_OK`.
     public static func check(_ rc: Int32) throws {
         if let err = from(rc: rc) { throw err }
     }

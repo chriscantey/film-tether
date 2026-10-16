@@ -1,0 +1,21 @@
+# Pinned bottles for fetch-compat-libs.sh: one per line, "formula tag sha256".
+# Used when Homebrew no longer lists a bottle for the tag but the blob is still
+# on GHCR (ghcr.io/v2/homebrew/core/<formula>/blobs/sha256:<sha>). The sha256
+# is the one Homebrew published in the formula's own history, so the file is
+# verified against the same value brew would have used.
+#
+# jpeg-turbo 3.2.0 Intel Sonoma: Homebrew dropped the tag in homebrew-core
+# cb00cb72. The last formula revision that listed it is 3b678035. Keeps the
+# Intel slice at macOS 14 instead of taking the build host's own libjpeg
+# (macOS 26).
+jpeg-turbo sonoma c1a02c5e74d687402700645d60f7045485d88ed9f2f615d301d1b081ad1e1f66
+
+# gettext 1.0 (libintl.8) Sonoma, both arches: the rebuild 2 bottle update
+# (homebrew-core e78efec19e) dropped every Sonoma tag and Intel entirely. The
+# last revision listing them is 5c728a8378 (rebuild 1). Without these no
+# Sonoma libintl.8.dylib exists to vendor. A slice then borrows the host's
+# copy (raising its min macOS) or goes without, and bundle.sh's link-closure
+# check refuses a bundle without it, since dyld would fail with "Library not
+# loaded: @rpath/libintl.8.dylib".
+gettext sonoma e0072004be0db53c5f501d6ab2b78b9219067243f8989c40604720751dd6bdc4
+gettext arm64_sonoma d11a97db1d735fb9860a9637e72b2765ef93536851d36c8f0b5cbbc22b539c5a

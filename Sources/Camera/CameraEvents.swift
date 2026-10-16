@@ -1,35 +1,32 @@
 import Foundation
 import CGPhoto2
 
-/// Drains libgphoto2's per-camera event queue and parses the strings Canon EOS
-/// bodies emit on property changes. This is how we learn the body's *live*
-/// metered exposure (Tv) during EVF streaming without polling, Canon's PTP
-/// event channel pushes a `PTP Property d102 changed, "shutterspeed" to "1/200"`
-/// line every time the meter recomputes.
-///
-/// Two consumers:
-///   • CameraCapture's Immediate-release path drains `FILE_ADDED` events to
-///     learn the on-camera filename after `eosremoterelease=Immediate`.
-///   • AppModel runs a long-lived loop here while connected so the UI's
-///     `meteredShutter` always reflects the body's most recent metering.
+/// Drains libgphoto2's per-camera event queue and parses the text libgphoto2
+/// prints for Canon EOS property changes. This is how we learn the body's live
+/// metered exposure (Tv) during EVF streaming without polling. The body sends
+/// a property change every time the meter recomputes, which libgphoto2 reports
+/// as a `PTP Property d102 changed, "shutterspeed" to "1/200"` line.
 @CameraActor
 public final class CameraEvents {
-    /// One libgphoto2 event reduced to the bits we actually care about. Raw
-    /// event payloads are kept inside this file, callers see typed values.
+    /// One libgphoto2 event reduced to the parts we use. The C payloads stay
+    /// inside this file, and callers see typed values.
     public enum Event: Sendable, Equatable {
-        /// No event during the timeout window. Caller loops on this.
+        /// No event during the timeout window, or a FOLDER_ADDED or
+        /// FILE_CHANGED event, or a FILE_ADDED with no path, all of which
+        /// `waitOne` folds into this case.
         case timeout
         /// New file landed on the camera (Internal RAM or card). Folder + name
-        /// are the on-camera path; CameraCapture downloads via gp_camera_file_get.
+        /// are the on-camera path. CameraCapture downloads via gp_camera_file_get.
         case fileAdded(folder: String, name: String)
-        /// A Canon property changed. `name` is libgphoto2's widget name when it
-        /// resolved one (e.g. "shutterspeed", "iso", "aperture") and `value` is
-        /// the new value as a string. `name` is nil when the property is one
-        /// libgphoto2 doesn't have a mapping for (it shows as the raw hex code).
+        /// A Canon property changed. `name` is libgphoto2's widget name (e.g.
+        /// "shutterspeed", "iso", "aperture") and `value` is the new value as a
+        /// string, nil when the line carries no quoted value. The parser never
+        /// produces a nil `name`: a property libgphoto2 has no name for arrives
+        /// as a bare `PTP Property d1b7 changed` line and comes out as
+        /// `.unknown(raw:)`.
         case propertyChanged(name: String?, value: String?, raw: String)
-        /// libgphoto2 fired GP_EVENT_CAPTURE_COMPLETE. We use this as a
-        /// confirmation that the body finished writing a still even when we
-        /// haven't yet seen FILE_ADDED.
+        /// libgphoto2 fired GP_EVENT_CAPTURE_COMPLETE. The capture drain
+        /// treats it as activity, not as the end of the shot.
         case captureComplete
         /// Anything we couldn't parse, kept so debug logs are honest.
         case unknown(raw: String)
@@ -43,11 +40,11 @@ public final class CameraEvents {
 
     /// Block on `gp_camera_wait_for_event` for up to `timeoutMs` milliseconds,
     /// return the first event that arrives (or `.timeout`). Safe to call in a
-    /// tight loop, libgphoto2 itself paces the underlying USB poll.
+    /// tight loop, because libgphoto2 paces the underlying USB poll.
     ///
-    /// Note: this is intentionally a *single* event per call. The body emits
-    /// dozens of property events per second during EVF; we want to keep the
-    /// loop in Swift land so the actor can yield between events.
+    /// This is intentionally a *single* event per call. The body emits dozens
+    /// of property events per second during EVF, and keeping the loop in
+    /// Swift land lets the actor yield between events.
     public func waitOne(timeoutMs: Int32) async throws -> Event {
         let cam = try session.gpCamera()
         let ctx = try session.gpContext()
@@ -58,7 +55,7 @@ public final class CameraEvents {
         if rc != GP_OK {
             // Bubble the error so the caller can decide whether to back off or
             // tear down. Most non-OK returns on this call mean the session
-            // died (e.g. body powered off mid-stream), caller stops.
+            // died (e.g. body powered off mid-stream), and the caller stops.
             throw CameraError.libGPhoto(
                 code: rc,
                 message: "gp_camera_wait_for_event failed (rc \(rc))"
@@ -93,8 +90,10 @@ public final class CameraEvents {
             return .unknown(raw: s)
 
         case GP_EVENT_FOLDER_ADDED, GP_EVENT_FILE_CHANGED:
-            // Neither matters for our flows, folder-added is the camera
-            // creating a new DCIM subdir, file-changed is metadata-only.
+            // No flow uses either. Folder-added is the camera creating a new
+            // DCIM subdir, and file-changed is metadata-only. Both come back
+            // as .timeout, so drain() stops on them and the capture's
+            // companion-file wait counts them as an empty poll.
             if eventData != nil { free(eventData) }
             return .timeout
 
@@ -104,11 +103,9 @@ public final class CameraEvents {
         }
     }
 
-    /// Drain all queued events with a per-call timeout, up to `budgetMs`
-    /// wall-clock milliseconds total. Used for "give me everything that's
-    /// been sitting in the queue right now without blocking long." Returns
-    /// the events in arrival order; never throws timeout (caller sees an
-    /// empty array if the queue was empty when the budget started).
+    /// Read queued events with a per-call timeout, up to `budgetMs`
+    /// wall-clock milliseconds total, stopping at the first `.timeout`.
+    /// Returns the events in arrival order, empty if none were queued.
     public func drain(budgetMs: Int, perCallMs: Int32 = 50) async -> [Event] {
         let deadline = Date().addingTimeInterval(TimeInterval(budgetMs) / 1000.0)
         var out: [Event] = []
@@ -120,8 +117,7 @@ public final class CameraEvents {
                 if case .timeout = e { break }
                 out.append(e)
             } catch {
-                // Session error inside drain, caller's outer loop will
-                // notice on the next session probe; bail out here.
+                // A session error inside drain: stop here.
                 break
             }
         }
@@ -130,15 +126,15 @@ public final class CameraEvents {
 
     // MARK: - Parsing
 
-    /// Canon EOS firmware emits unknown-event strings like:
+    /// libgphoto2 reports EOS property changes as unknown-event text like:
     ///   `PTP Property d102 changed, "shutterspeed" to "1/200"`
     ///   `PTP Property d101 changed`
-    /// Return (name, value) when both are present; (name, nil) when libgphoto2
-    /// resolved the property name but the value didn't quote; nil when the
+    /// Return (name, value) when both are present, (name, nil) when libgphoto2
+    /// resolved the property name but the value didn't quote, and nil when the
     /// whole line is something else (Focus Points, CTGInfoCheckComplete, …).
     static func parseUnknownPropertyChange(_ s: String) -> (String, String?)? {
         guard s.contains("PTP Property") else { return nil }
-        // Strip prefix; split on `, "name" to "value"` if present.
+        // The name is the text between the first quote and `" to "`.
         if let quoteRange = s.range(of: "\""),
            let afterFirst = s.range(of: "\" to \"") {
             let nameStart = quoteRange.upperBound
@@ -146,14 +142,13 @@ public final class CameraEvents {
             guard nameStart < nameEnd else { return nil }
             let name = String(s[nameStart..<nameEnd])
             let valueStart = afterFirst.upperBound
-            // Find the closing quote of the value.
             guard let closing = s.range(of: "\"", range: valueStart..<s.endIndex) else {
                 return (name, nil)
             }
             let value = String(s[valueStart..<closing.lowerBound])
             return (name, value)
         }
-        // Form 2: `"name" changed`, name only, no value.
+        // Otherwise `"name" changed`, name only, no value.
         if let first = s.range(of: "\""),
            let second = s.range(of: "\"", range: first.upperBound..<s.endIndex) {
             let name = String(s[first.upperBound..<second.lowerBound])

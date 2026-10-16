@@ -1,0 +1,4 @@
+# SHA-256 of each libgphoto2 release archive the patched camlib is built from,
+# checked by scripts/build-patched-camlib.sh and build-patched-camlib-slice.sh
+# after download. The value is the one Homebrew's libgphoto2 formula records.
+5df9e774eb4ab6087a193afff84dcafe9f666e3443fe29e73e6779f659ff7f28  libgphoto2-2.5.34.tar.bz2

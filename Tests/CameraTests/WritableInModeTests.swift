@@ -30,4 +30,27 @@ final class WritableInModeTests: XCTestCase {
     func testUnknownPropDefaultsToWritable() {
         XCTAssertTrue(CameraProperties.isWritable(prop: "magicProperty", inMode: "Av"))
     }
+
+    // MARK: - Which body events move a picker
+
+    func testShutterEventMovesThePickerInTvAndM() {
+        for mode in ["Tv", "TV", "M", "Manual"] {
+            XCTAssertTrue(CameraProperties.pickerFollowsEvent(prop: "shutterspeed", mode: mode, value: "1/125"), mode)
+        }
+    }
+
+    func testShutterEventLeavesThePickerInAvAndP() {
+        for mode in ["Av", "AV", "P"] {
+            XCTAssertFalse(CameraProperties.pickerFollowsEvent(prop: "shutterspeed", mode: mode, value: "1/125"), mode)
+        }
+    }
+
+    func testAnAutoValueAlwaysMovesThePicker() {
+        for mode in ["Av", "P", "Tv", "M"] {
+            for value in ["auto", "Auto", ""] {
+                XCTAssertTrue(CameraProperties.pickerFollowsEvent(prop: "shutterspeed", mode: mode, value: value),
+                              "\(mode) \(value)")
+            }
+        }
+    }
 }

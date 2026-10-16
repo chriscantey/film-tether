@@ -4,19 +4,18 @@ import AppKit
 /// Quarter-turn rotation applied to the live-view preview.
 ///
 /// This is a *display* transform only. Nothing is written to the camera and
-/// captured files are never re-encoded, the body still hands us frames and
-/// RAWs in its native orientation. Rotation is NOT recorded in the capture's
-/// metadata today. The intent is that it eventually should be, so downstream
-/// tools know which way is up.
+/// captured files are never re-encoded. The body still hands us frames and
+/// RAWs in its native orientation. With metadata writing on (the default), the
+/// quarter turn is recorded with the capture's metadata (see `MetadataWriter`),
+/// so downstream tools know which way is up.
 ///
-/// The important structural rule: everything upstream of the final compose step
-/// stays in **unrotated sensor space**, metering centre, the `eoszoomposition`
-/// calibration, focus peaking, and (later) crop geometry. Only the last blit and
-/// the pointer/arrow-key mapping know rotation exists. That keeps the hard-won
-/// zoom calibration in AppModel valid at every rotation without re-measuring it.
+/// Everything upstream of the final compose step stays in unrotated sensor
+/// space: metering center, the `eoszoomposition` calibration, focus peaking,
+/// and crop geometry. That keeps the measured punch-in table (`PunchInGrid`)
+/// valid at every rotation without re-measuring it.
 ///
-/// Both coordinate spaces referenced below are normalized [0,1]² and **y-down**
-/// (SwiftUI/AppKit event convention, matching `AppModel.meteringCenter`).
+/// Both coordinate spaces referenced below are normalized [0,1]² and y-down
+/// (SwiftUI's convention, matching `AppModel.meteringCenter`).
 public enum PreviewRotation: Int, CaseIterable, Codable, Sendable {
     case none = 0
     case cw90 = 90
@@ -47,7 +46,7 @@ public enum PreviewRotation: Int, CaseIterable, Codable, Sendable {
     /// callers know a 3:2 sensor frame displays as 2:3.
     public var swapsAxes: Bool { self == .cw90 || self == .cw270 }
 
-    /// Compact label for the toolbar button and menu items.
+    /// Compact label, such as "90°".
     public var displayName: String { "\(rawValue)°" }
 
     /// Aspect ratio to display a sensor frame of `sensorAspect` (width ÷ height)
@@ -58,8 +57,8 @@ public enum PreviewRotation: Int, CaseIterable, Codable, Sendable {
 
     // MARK: - Point mapping
 
-    /// Map a point in unrotated **sensor** space to where it appears in the
-    /// **displayed** (rotated) frame.
+    /// Map a point in unrotated sensor space to where it appears in the
+    /// displayed (rotated) frame.
     ///
     /// Derivation for `.cw90`: rotating the image a quarter turn clockwise sends
     /// the sensor's top-left corner to the display's top-right, so
@@ -73,7 +72,7 @@ public enum PreviewRotation: Int, CaseIterable, Codable, Sendable {
         }
     }
 
-    /// Inverse of `displayPoint(fromSensor:)`, turns a click in the rotated
+    /// Inverse of `displayPoint(fromSensor:)`: turns a click in the rotated
     /// preview back into the sensor coordinate the camera understands.
     public func sensorPoint(fromDisplay p: CGPoint) -> CGPoint {
         switch self {
@@ -82,6 +81,34 @@ public enum PreviewRotation: Int, CaseIterable, Codable, Sendable {
         case .cw180: return CGPoint(x: 1 - p.x, y: 1 - p.y)
         case .cw270: return CGPoint(x: 1 - p.y, y: p.x)
         }
+    }
+
+    /// Map an axis-aligned rect in unrotated sensor space to where it
+    /// appears in the displayed frame.
+    ///
+    /// A quarter turn is the only rotation that carries an axis-aligned
+    /// rectangle to another axis-aligned rectangle, which is what lets the crop
+    /// be *stored* in sensor space (the structural rule at the top of this
+    /// file) while being *edited* as a plain rectangle on screen. Any other
+    /// angle would make one of the two a quadrilateral, and the editor would
+    /// have to carry the angle through every grip.
+    ///
+    /// Built from two opposite corners rather than by cases, so it cannot
+    /// disagree with `displayPoint(fromSensor:)`. `standardized` puts the
+    /// corners back in order after a turn that swapped them.
+    public func displayRect(fromSensor r: CGRect) -> CGRect {
+        Self.rect(from: displayPoint(fromSensor: CGPoint(x: r.minX, y: r.minY)),
+                  to: displayPoint(fromSensor: CGPoint(x: r.maxX, y: r.maxY)))
+    }
+
+    /// Inverse of `displayRect(fromSensor:)`.
+    public func sensorRect(fromDisplay r: CGRect) -> CGRect {
+        Self.rect(from: sensorPoint(fromDisplay: CGPoint(x: r.minX, y: r.minY)),
+                  to: sensorPoint(fromDisplay: CGPoint(x: r.maxX, y: r.maxY)))
+    }
+
+    private static func rect(from a: CGPoint, to b: CGPoint) -> CGRect {
+        CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y).standardized
     }
 
     /// Map a *direction* the user expressed on screen (e.g. an arrow key) into
@@ -117,8 +144,10 @@ public enum PreviewRotation: Int, CaseIterable, Codable, Sendable {
     /// The destination context is y-up, which is Core Graphics' default for a
     /// bitmap context, so a *visual* clockwise turn is a negative rotation
     /// angle. Output is forced to device RGB rather than inheriting the source
-    /// colour space, because a grayscale or CMYK source would not accept the
-    /// 32-bit bitmapInfo below.
+    /// color space, because a grayscale or CMYK source would not accept the
+    /// 32-bit bitmapInfo below. Device RGB is not sRGB (see `PixelSampler`),
+    /// which is safe here because these pixels are only displayed: the
+    /// eyedropper samples the unrotated frame in sRGB, never this output.
     public func rotate(_ cg: CGImage) -> CGImage? {
         guard self != .none else { return cg }
         let w = cg.width, h = cg.height
@@ -134,7 +163,7 @@ public enum PreviewRotation: Int, CaseIterable, Codable, Sendable {
             bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
                 | CGBitmapInfo.byteOrder32Little.rawValue
         ) else { return nil }
-        ctx.interpolationQuality = .none   // exact quarter turn: no resampling needed
+        ctx.interpolationQuality = .none
         ctx.translateBy(x: CGFloat(outW) / 2, y: CGFloat(outH) / 2)
         ctx.rotate(by: -CGFloat(rawValue) * .pi / 180)
         ctx.draw(cg, in: CGRect(x: -CGFloat(w) / 2, y: -CGFloat(h) / 2,

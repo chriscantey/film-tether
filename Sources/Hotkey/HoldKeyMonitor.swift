@@ -1,34 +1,29 @@
-//
-//  HoldKeyMonitor.swift
-//  FilmTether, Hotkey module
-//
-//  Hold-to-zoom hotkey monitor for the focus-check feature.
-//  Press-and-hold the trigger to send
-//  `eoszoom=5` to the camera; release to send `eoszoom=1`. The trigger is
-//  either a keyCode (legacy) or a bare modifier via `Config.triggerModifier`
-//  (default in-app: Shift = zoom). Arrow keys while held nudge the zoom rect.
-//
-//  Two scopes:
-//    - Local  (config.globalScope == false): NSEvent local monitor, fires only
-//                                             when our window is frontmost; no
-//                                             special permissions needed.
-//    - Global (config.globalScope == true):  CGEventTap on the session event
-//                                             tap, fires regardless of focus;
-//                                             requires BOTH Accessibility AND
-//                                             Input Monitoring on macOS 14+.
-//
-//  Emits ONE `.pressed` on first non-autorepeat keyDown of the configured key,
-//  ONE `.released` on the matching keyUp, and `.arrow(direction)` on each
-//  arrow keyDown that occurs *while* the configured key is held. Arrows when
-//  the key isn't held are ignored. Autorepeat keyDowns of the configured key
-//  are dropped.
-//
-
 import Foundation
 import AppKit
 import CoreGraphics
-import Carbon.HIToolbox   // kVK_* constants, clearer than magic numbers
+import Carbon.HIToolbox   // kVK_* constants
 
+/// Hold-to-zoom hotkey monitor for the focus-check feature. It emits `.pressed`
+/// and `.released` around a hold of the trigger. The app punches in to 5x on
+/// press and restores the zoom from before the hold on release. The trigger is
+/// either a keyCode or a bare modifier via `Config.triggerModifier` (Shift when
+/// the app's Shift-to-zoom setting is on). Arrow keys while the trigger is
+/// held nudge the zoom rect.
+///
+/// Two scopes:
+///   - Local (`config.globalScope == false`): an NSEvent local monitor. It fires
+///     only when our window is frontmost and needs no special permissions.
+///   - Global (`config.globalScope == true`): a CGEventTap on the session event
+///     tap. It fires regardless of focus, and `start()` requires both
+///     Accessibility and Input Monitoring before it creates the tap.
+///     `startFallingBackToLocal()` starts the local monitor instead when the
+///     tap cannot start.
+///
+/// Emits one `.pressed` on the first non-autorepeat keyDown of the configured
+/// key, one `.released` on the matching keyUp, and `.arrow(direction)` on each
+/// arrow keyDown that occurs *while* the configured key is held. Arrows when
+/// the key isn't held are ignored. Autorepeat keyDowns of the configured key
+/// are dropped.
 public final class HoldKeyMonitor: @unchecked Sendable {
 
     // MARK: - Public types
@@ -45,8 +40,9 @@ public final class HoldKeyMonitor: @unchecked Sendable {
 
     /// A bare modifier used as the hold-to-zoom trigger (Shift = zoom by
     /// default). When `Config.triggerModifier` is set, press/release are detected
-    /// from `flagsChanged` transitions of this modifier instead of a keyCode,     /// because modifiers don't emit keyDown/keyUp with a keycode. The configured
-    /// `keyCode` is then used ONLY for the arrow-nudge gate.
+    /// from `flagsChanged` transitions of this modifier instead of a keyCode,
+    /// because modifiers don't emit keyDown/keyUp with a keycode. The configured
+    /// `keyCode` is then ignored.
     public enum TriggerModifier: Sendable { case shift, command, option, control }
 
     public struct ModifierSet: OptionSet, Sendable {
@@ -59,16 +55,43 @@ public final class HoldKeyMonitor: @unchecked Sendable {
     }
 
     public struct Config: Sendable {
-        /// US-layout key code. 0x31 = Space (kVK_Space). Override for other layouts.
-        /// In `triggerModifier` mode this is NOT the trigger, it's only consulted
-        /// for the arrow-nudge gate, so leave it at any unused value.
+        /// Virtual key code of the trigger key. 0x31 is Space (kVK_Space).
+        /// In `triggerModifier` mode this is ignored.
         public var keyCode: CGKeyCode = 0x31
         /// When set, the hold trigger is this bare modifier (via flagsChanged)
         /// rather than `keyCode`. nil → classic keycode trigger.
         public var triggerModifier: TriggerModifier? = nil
         /// `true` → CGEventTap (requires permissions). `false` → NSEvent local monitor.
         public var globalScope: Bool = false
+        /// While this returns true (the app passes "a text field has the
+        /// caret"), the monitor stands down: no `.pressed`, no `.arrow`, and
+        /// no key is consumed, so Shift capitalizes and Space types a space.
+        /// `.released` still goes out, so a punch-in that began before the
+        /// caret landed in a field always ends. Called on the main thread in
+        /// local scope and on the tap thread in global scope.
+        public var isSuspended: (@Sendable () -> Bool)? = nil
         public init() {}
+    }
+
+    /// Where a running monitor listens.
+    public enum Scope: Sendable { case local, global }
+
+    /// The two permission checks the global scope needs, injectable so the
+    /// start decision can be tested without the real privacy settings.
+    public struct PermissionCheck: Sendable {
+        public var accessibility: @Sendable () -> Bool
+        public var inputMonitoring: @Sendable () -> Bool
+
+        public init(accessibility: @escaping @Sendable () -> Bool,
+                    inputMonitoring: @escaping @Sendable () -> Bool) {
+            self.accessibility = accessibility
+            self.inputMonitoring = inputMonitoring
+        }
+
+        /// The process's real Accessibility and Input Monitoring state.
+        public static let system = PermissionCheck(
+            accessibility: { Permissions.hasAccessibility },
+            inputMonitoring: { Permissions.hasInputMonitoring })
     }
 
     public enum PermissionError: Error, LocalizedError {
@@ -83,32 +106,44 @@ public final class HoldKeyMonitor: @unchecked Sendable {
             case .inputMonitoringDenied:
                 return "Global hotkey requires Input Monitoring permission. Enable it in System Settings → Privacy & Security → Input Monitoring."
             case .bothDenied:
-                return "Global hotkey requires BOTH Accessibility and Input Monitoring permissions. Enable both in System Settings → Privacy & Security."
+                return "Global hotkey requires Accessibility and Input Monitoring permissions. Enable both in System Settings → Privacy & Security."
             }
+        }
+    }
+
+    /// The permission the global scope is missing, or nil when both are granted.
+    public static func missingPermission(accessibility: Bool, inputMonitoring: Bool) -> PermissionError? {
+        switch (accessibility, inputMonitoring) {
+        case (false, false): return .bothDenied
+        case (false, true):  return .accessibilityDenied
+        case (true, false):  return .inputMonitoringDenied
+        case (true, true):   return nil
         }
     }
 
     // MARK: - Stored config + state
 
     private let config: Config
+    private let permissions: PermissionCheck
 
-    /// Currently-running mode (nil when stopped). Tracked so `stop()` knows
+    /// Currently-running scope (nil when stopped). Tracked so `stop()` knows
     /// which teardown path to take and so we don't double-`start()`.
-    private enum RunMode { case local, global }
-    private var runMode: RunMode?
+    private var runMode: Scope?
 
-    /// Logical "is our configured hotkey currently held down?", set true by
-    /// the first non-autorepeat keyDown matching `config.keyCode`, cleared on
-    /// the matching keyUp. Used to (a) suppress duplicate `.pressed` from
+    /// Where the monitor is listening, or nil when it is stopped.
+    public var scope: Scope? { runMode }
+
+    /// Logical "is our configured hotkey currently held down?", set on the
+    /// trigger's press and cleared on its release or by `stop()`. Used to (a) suppress duplicate `.pressed` from
     /// autorepeat, (b) gate `.arrow(...)` emission to only-while-held.
-    /// Accessed from the CGEventTap callback thread AND the NSEvent main-thread
+    /// Accessed from the CGEventTap callback thread and the NSEvent main-thread
     /// monitor, so we serialize through `stateLock`.
     private var keyHeld: Bool = false
     private let stateLock = NSLock()
 
     // MARK: - Local-scope state
 
-    private var localMonitor: Any?  // opaque token returned by NSEvent
+    private var localMonitor: Any?
 
     // MARK: - Global-scope state
 
@@ -117,8 +152,7 @@ public final class HoldKeyMonitor: @unchecked Sendable {
     private var tapRunLoop: CFRunLoop?
     private var tapThread: Thread?
     /// Signaled by the tap thread once its CFRunLoop is registered and ready
-    /// to run; `start()` waits on this so we don't return before the tap is
-    /// actually live.
+    /// to run. `start()` waits on this for up to 2 s.
     private let tapReadySemaphore = DispatchSemaphore(value: 0)
 
     // MARK: - AsyncStream plumbing
@@ -129,20 +163,20 @@ public final class HoldKeyMonitor: @unchecked Sendable {
 
     // MARK: - Init / public surface
 
-    public init(config: Config = Config()) {
+    public init(config: Config = Config(), permissions: PermissionCheck = .system) {
         self.config = config
+        self.permissions = permissions
     }
 
     deinit {
-        // Best-effort teardown; callers should call stop() explicitly because
-        // deinit may run off the CFRunLoop thread.
+        // Best-effort teardown. Callers should call stop() explicitly.
         stopUnsafe()
     }
 
     /// Lazy single-consumer event stream. The continuation is captured on first
-    /// access and reused; later subscribers get the SAME stream (Swift's
-    /// AsyncStream is single-consumer by design, which matches our "App layer
-    /// only subscribes once" contract from the spec).
+    /// access and reused. Later subscribers get the same stream (Swift's
+    /// AsyncStream is single-consumer by design, and the App layer subscribes
+    /// only once).
     public var events: AsyncStream<Event> {
         streamLock.lock()
         defer { streamLock.unlock() }
@@ -155,19 +189,14 @@ public final class HoldKeyMonitor: @unchecked Sendable {
     }
 
     /// Start monitoring. In `globalScope`, throws if either permission is
-    /// missing, does NOT prompt the user (call Permissions.request* first).
+    /// missing. It does not prompt the user (call Permissions.request* first).
     public func start() throws {
-        guard runMode == nil else { return }   // idempotent
+        guard runMode == nil else { return }
 
         if config.globalScope {
-            // BOTH gates required on macOS 14+.
-            let ax  = Permissions.hasAccessibility
-            let hid = Permissions.hasInputMonitoring
-            switch (ax, hid) {
-            case (false, false): throw PermissionError.bothDenied
-            case (false, true):  throw PermissionError.accessibilityDenied
-            case (true, false):  throw PermissionError.inputMonitoringDenied
-            case (true, true):   break
+            if let missing = Self.missingPermission(accessibility: permissions.accessibility(),
+                                                    inputMonitoring: permissions.inputMonitoring()) {
+                throw missing
             }
             try startGlobal()
             runMode = .global
@@ -177,7 +206,25 @@ public final class HoldKeyMonitor: @unchecked Sendable {
         }
     }
 
-    /// Stop monitoring and tear down all resources. Idempotent.
+    /// Start in the configured scope. When the global scope cannot start, a
+    /// permission missing or the event tap refused, start the local monitor
+    /// with the same key instead, so the key still works while the app's
+    /// window is in front. Returns why the global scope did not start, or nil
+    /// when the monitor started in the scope it was configured for.
+    @discardableResult
+    public func startFallingBackToLocal() -> Error? {
+        do {
+            try start()
+            return nil
+        } catch {
+            guard runMode == nil else { return error }
+            startLocal()
+            runMode = .local
+            return error
+        }
+    }
+
+    /// Stop monitoring. Idempotent.
     public func stop() {
         stopUnsafe()
     }
@@ -190,8 +237,8 @@ public final class HoldKeyMonitor: @unchecked Sendable {
             }
             localMonitor = nil
         case .global:
-            // Disable + invalidate tap; CFRunLoopStop kicks the runloop thread
-            // out of CFRunLoopRun() so the pthread exits its body.
+            // Disable + invalidate tap. CFRunLoopStop kicks the runloop thread
+            // out of CFRunLoopRun() so the tap thread exits.
             if let tap = eventTap {
                 CGEvent.tapEnable(tap: tap, enable: false)
                 CFMachPortInvalidate(tap)
@@ -221,23 +268,24 @@ public final class HoldKeyMonitor: @unchecked Sendable {
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] nsEvent in
             guard let self else { return nsEvent }
             // Modifier-trigger mode (Shift=zoom): press/release ride on
-            // flagsChanged. NEVER consume the modifier, Shift must keep
+            // flagsChanged. Never consume the modifier: Shift must keep
             // working normally for everything else while the app is focused.
             if self.config.triggerModifier != nil, nsEvent.type == .flagsChanged {
                 self.handleModifierTransition(down: self.flagsContainTrigger(nsEvent.modifierFlags))
                 return nsEvent
             }
-            // Swallow the event ONLY if we recognized it as our configured
+            // Swallow the event only if we recognized it as our configured
             // hotkey or as an arrow key delivered while the hotkey is held.
             // Returning nsEvent for an unrecognized keypress to a window with
-            // no first-responder for that key triggers AppKit's system beep,             // producing the "error-beep the whole time I'm holding
-            // spacebar" symptom. Consume when handled; pass through otherwise.
+            // no first-responder for that key triggers AppKit's system beep,
+            // which would beep the whole time the key is held. Consume when
+            // handled, pass through otherwise.
             let keyCode = CGKeyCode(nsEvent.keyCode)
-            // In modifier mode the configured keyCode is NOT ours (Shift is the
+            // In modifier mode the configured keyCode is not ours (Shift is the
             // trigger), so only arrows-while-held are consumed.
             let triggerByKey = (self.config.triggerModifier == nil) && (keyCode == self.config.keyCode)
-            let handled = triggerByKey ||
-                          (self.arrowKey(for: keyCode) != nil && self.isKeyHeld())
+            let handled = !self.suspended() && (triggerByKey ||
+                          (self.arrowKey(for: keyCode) != nil && self.isKeyHeld()))
             self.handleNSEvent(nsEvent)
             return handled ? nil : nsEvent
         }
@@ -248,13 +296,14 @@ public final class HoldKeyMonitor: @unchecked Sendable {
         switch ev.type {
         case .keyDown:
             // NSEvent surfaces autorepeat via `.isARepeat`. In modifier-trigger
-            // mode the keyCode is never the trigger, skip the press path.
+            // mode the keyCode is never the trigger, so the press path is skipped.
             if config.triggerModifier == nil, keyCode == config.keyCode {
-                if ev.isARepeat { return }      // drop autorepeat
+                if ev.isARepeat { return }
                 deliverPressed(modifiers: translate(nsModifiers: ev.modifierFlags))
             } else if let arrow = arrowKey(for: keyCode) {
-                // Arrow keys only fire while the configured hotkey is held.
-                if isKeyHeld() {
+                // Arrow keys only fire while the configured hotkey is held,
+                // and never while a text field has the caret.
+                if isKeyHeld(), !suspended() {
                     deliver(.arrow(arrow))
                 }
             }
@@ -306,8 +355,8 @@ public final class HoldKeyMonitor: @unchecked Sendable {
             (1 << CGEventType.keyUp.rawValue)   |
             (1 << CGEventType.flagsChanged.rawValue)
 
-        // refcon holds an UNRETAINED pointer to self. We control the lifetime
-        // by calling stop() before self is deallocated; passUnretained avoids
+        // refcon holds an unretained pointer to self. We control the lifetime
+        // by calling stop() before self is deallocated. passUnretained avoids
         // a retain cycle (CGEventTap → self → tap).
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
@@ -330,10 +379,8 @@ public final class HoldKeyMonitor: @unchecked Sendable {
 
         // Spin a dedicated NSThread carrying its own CFRunLoop. Apple's docs
         // for CGEventTap state the tap must be driven by a runloop that's
-        // alive for the tap's lifetime; running it on the main loop would
-        // couple hotkey latency to SwiftUI redraw cadence. Using NSThread
-        // instead of raw pthread because the Foundation lifecycle is cleaner
-        // and the underlying runloop semantics are identical.
+        // alive for the tap's lifetime. Running it on the main loop would
+        // couple hotkey latency to SwiftUI redraw cadence.
         let thread = Thread { [weak self] in
             guard let self else { return }
             let rl = CFRunLoopGetCurrent()
@@ -348,28 +395,29 @@ public final class HoldKeyMonitor: @unchecked Sendable {
         self.tapThread = thread
         thread.start()
 
-        // Don't return from start() until the tap is wired up and listening,
-        // otherwise an immediate keypress could race the runloop registration.
+        // Wait up to 2 s for the tap to be wired up and listening, so an
+        // immediate keypress does not race the runloop registration.
         _ = tapReadySemaphore.wait(timeout: .now() + .seconds(2))
     }
 
-    /// C-callback bridge. MUST be `@convention(c)`, CGEventTap APIs are
-    /// pure-C function pointers and a Swift closure won't bridge.
+    /// The tap callback is a C function pointer, so this closure can capture
+    /// nothing. `self` comes in through `refcon`.
     private static let tapCallback: CGEventTapCallBack = { _, type, cgEvent, refcon in
         guard let refcon else { return Unmanaged.passUnretained(cgEvent) }
         let monitor = Unmanaged<HoldKeyMonitor>.fromOpaque(refcon).takeUnretainedValue()
         monitor.handleCGEvent(type: type, event: cgEvent)
-        // Transparent tap, return the event unchanged; never consume keys.
-        // `cgEvent` is autoreleased by the system runloop, so passing it back
-        // via passUnretained is correct (no retain change).
+        // Return the event unchanged and never consume keys. The tap is
+        // created active (`.defaultTap`), but this callback only listens.
+        // The callback does not own `cgEvent`, so returning it unretained
+        // passes the same event through unchanged.
         return Unmanaged.passUnretained(cgEvent)
     }
 
     private func handleCGEvent(type: CGEventType, event: CGEvent) {
-        // Tap can be disabled by the system (timeout, user-initiated), we
+        // The system can disable the tap (timeout, user-initiated). We then
         // get a tapDisabledByTimeout/tapDisabledByUserInput event and must
-        // re-enable. Without this, a long Algorithm step or sleep can wedge
-        // the tap silently.
+        // re-enable. Without this, a slow callback or a sleep can wedge the
+        // tap silently.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
@@ -382,12 +430,11 @@ public final class HoldKeyMonitor: @unchecked Sendable {
         switch type {
         case .keyDown:
             if config.triggerModifier == nil, keyCode == config.keyCode {
-                // Drop autorepeat keyDowns of the configured hotkey.
                 let autorepeat = event.getIntegerValueField(.keyboardEventAutorepeat)
                 if autorepeat != 0 { return }
                 deliverPressed(modifiers: translate(cgFlags: event.flags))
             } else if let arrow = arrowKey(for: keyCode) {
-                if isKeyHeld() {
+                if isKeyHeld(), !suspended() {
                     deliver(.arrow(arrow))
                 }
             }
@@ -408,12 +455,19 @@ public final class HoldKeyMonitor: @unchecked Sendable {
 
     // MARK: - Delivery helpers
 
+    private func suspended() -> Bool {
+        config.isSuspended?() ?? false
+    }
+
     private func deliverPressed(modifiers: ModifierSet) {
+        // Typing in a field: not a zoom. keyHeld stays false, so the matching
+        // release is dropped too and arrows are not taken as nudges.
+        if suspended() { return }
         stateLock.lock()
         let wasHeld = keyHeld
         keyHeld = true
         stateLock.unlock()
-        // Belt-and-suspenders: if some upstream layer ever bypasses the
+        // Second guard: if some upstream layer ever bypasses the
         // autorepeat-drop, don't emit a duplicate `.pressed`.
         guard !wasHeld else { return }
         deliver(.pressed(modifiers: modifiers))
@@ -455,15 +509,15 @@ public final class HoldKeyMonitor: @unchecked Sendable {
         return result
     }
 
-    /// Map US-layout arrow keycodes to `ArrowKey`. Keycodes are layout-
-    /// independent on macOS for the arrow cluster (they live in the dedicated
-    /// arrow block), so hardcoding is safe across QWERTY/Dvorak/Colemak.
+    /// Map the arrow keycodes to `ArrowKey`. Keycodes are layout-independent on
+    /// macOS for the arrow cluster (they live in the dedicated arrow block), so
+    /// this is safe across QWERTY/Dvorak/Colemak.
     private func arrowKey(for keyCode: CGKeyCode) -> ArrowKey? {
         switch Int(keyCode) {
-        case kVK_UpArrow:    return .up        // 0x7E
-        case kVK_DownArrow:  return .down      // 0x7D
-        case kVK_LeftArrow:  return .left      // 0x7B
-        case kVK_RightArrow: return .right     // 0x7C
+        case kVK_UpArrow:    return .up
+        case kVK_DownArrow:  return .down
+        case kVK_LeftArrow:  return .left
+        case kVK_RightArrow: return .right
         default:             return nil
         }
     }

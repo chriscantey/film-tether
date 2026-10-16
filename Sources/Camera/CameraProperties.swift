@@ -2,7 +2,19 @@ import Foundation
 import CGPhoto2
 
 /// Read/write exposure properties via the libgphoto2 widget tree.
-/// All methods run on `CameraActor`'s pinned thread.
+/// Instance methods run on `CameraActor`'s pinned thread.
+///
+/// The price of a read, in `gp_camera_get_config` calls: each one
+/// rebuilds the camera's whole config tree, whichever leaf is wanted, and all
+/// per-name reads funnel through `WidgetHelpers.fetchRoot` (via
+/// `resolveLeaf`):
+///
+///   getString(name)      1
+///   choices(for: name)   1
+///   setString / writeToggle   1 get_config + 1 set_single_config per attempt,
+///                        setString makes up to 3 attempts on -110
+///   setExposureSimulation     up to 2 get_config (one per leaf name tried) + 1 set
+///   snapshot(), choicesSnapshot()   1 each, however many leaves
 @CameraActor
 public final class CameraProperties {
     private let session: CameraSession
@@ -13,6 +25,8 @@ public final class CameraProperties {
 
     // MARK: - Generic accessors
 
+
+    /// Costs one `gp_camera_get_config` (resolveLeaf → fetchRoot).
     public func getString(_ name: String) async throws -> String {
         let cam = try session.gpCamera()
         let ctx = try session.gpContext()
@@ -28,17 +42,20 @@ public final class CameraProperties {
         }
     }
 
-    /// Public setter used by CameraCapture (eosremoterelease=Immediate) and any
-    /// caller that needs raw widget write access without going through a
-    /// dedicated convenience method. The convenience methods (setIso etc)
-    /// still wrap this; this is the one source of truth for the retry loop.
-    public func setString(_ name: String, value: String) async throws {
-        // Retry up to 3x on GP_ERROR_IO_IN_PROGRESS (-110). That error means
+    /// Raw widget write access. The convenience methods (setIso etc) wrap
+    /// this. The -110 retry lives here only.
+    ///
+    /// - Parameter retryInProgress: retry on -110 as described below. The
+    ///   app's autofocus passes false so every write it sends happens
+    ///   exactly once on the wire.
+    public func setString(_ name: String, value: String, retryInProgress: Bool = true) async throws {
+        // Retry on GP_ERROR_CAMERA_BUSY (-110, libgphoto2's "I/O in
+        // progress"), at most three attempts in all. That error means
         // libgphoto2's port has another transaction in flight (usually a
-        // manual-focus drive that hasn't drained yet). Brief sleep + retry
-        // lets the in-flight op complete before our write. Without this,
-        // a user changing ISO right after pressing focus buttons sees a
-        // permanent error in the UI even though the body itself is fine.
+        // manual-focus drive that hasn't drained yet). With `retryInProgress`,
+        // a 250 ms sleep before each retry lets the in-flight op complete.
+        // Without this, a user changing ISO right after pressing focus buttons
+        // sees a permanent error in the UI even though the body itself is fine.
         let cam = try session.gpCamera()
         let ctx = try session.gpContext()
         var lastError: Error?
@@ -50,7 +67,7 @@ public final class CameraProperties {
                 try WidgetHelpers.commit(camera: cam, context: ctx, name: name, leaf: leaf)
                 CameraLog.properties.info("set \(name, privacy: .public) ← \(value, privacy: .public)\(attempt > 1 ? " (attempt \(attempt))" : "")")
                 return
-            } catch CameraError.libGPhoto(let code, _) where code == -110 && attempt < 3 {
+            } catch CameraError.libGPhoto(let code, _) where code == -110 && attempt < 3 && retryInProgress {
                 CameraLog.properties.debug("set \(name, privacy: .public): -110 in_progress on attempt \(attempt, privacy: .public), retrying after 250ms")
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 continue
@@ -63,6 +80,7 @@ public final class CameraProperties {
         throw lastError ?? CameraError.libGPhoto(code: -1, message: "set \(name) failed")
     }
 
+    /// Costs one `gp_camera_get_config` (resolveLeaf → fetchRoot).
     public func choices(for name: String) async throws -> [String] {
         let cam = try session.gpCamera()
         let ctx = try session.gpContext()
@@ -86,17 +104,16 @@ public final class CameraProperties {
         public var battery: String?
         public var focusMode: String?
         public var meteringMode: String?
-        /// Unix timestamp the camera believes it's at. Read from the `datetime`
-        /// widget (TEXT or DATE depending on libgphoto2 build). Used by the
-        /// status footer to show whether the body's clock is correct; if it's
-        /// wrong, the user can hit the Sync Camera Clock menu item.
+        /// The time the camera's clock reads, from a `datetime` DATE leaf. The
+        /// 7D exposes only `datetimeutc` (see `syncDateTimeToHostLocal`), so on
+        /// a 7D this stays nil. Settings shows it, and enables "Set camera
+        /// clock to this Mac's time" only when it is present.
         public var cameraDateTime: Date?
     }
 
-    /// Read all common properties in ONE `gp_camera_get_config` traversal. The default
-    /// path (one read per property) issues N USB transactions and is ~100ms per call;
-    /// bulk-read does one big tree fetch + N in-memory lookups, which is roughly 5× faster
-    /// AND much gentler on the body. The 7D in particular gets confused by tight loops
+    /// Read all common properties in one `gp_camera_get_config` traversal
+    /// instead of one per property (see the cost table above). A per-property
+    /// read is ~100ms per call. The 7D in particular gets confused by tight loops
     /// of independent get_config calls (it sometimes returns stale data from libgphoto2's
     /// internal cache or partially-updates the tree mid-read).
     public func snapshot() async throws -> Snapshot {
@@ -107,7 +124,6 @@ public final class CameraProperties {
         guard let root else { throw CameraError.propertyNotFound(name: "<root>") }
         defer { gp_widget_unref(root) }
 
-        // Helper: lookup a leaf in the root we already fetched (no extra USB).
         func leafByName(_ name: String) -> OpaquePointer? {
             var leaf: OpaquePointer? = nil
             let rc = name.withCString { cName in
@@ -129,27 +145,19 @@ public final class CameraProperties {
         if let kStr = readStringLeaf("colortemperature"), let k = Int(kStr) {
             snap.kelvin = k
         }
-        // The 7D libgphoto2 driver normally uses "autoexposuremode"; fall back to
-        // "expprogram" for newer builds. Don't issue extra get_config calls for the
-        // fallback, both leaves live under the same root we already have.
+        // The 7D libgphoto2 driver normally uses "autoexposuremode". Fall back to
+        // "expprogram" for newer builds. The fallback costs no extra get_config,
+        // because both leaves live under the same root we already have.
         snap.mode = readStringLeaf("autoexposuremode") ?? readStringLeaf("expprogram")
         snap.imageFormat = readStringLeaf("imageformat")
         snap.battery = readStringLeaf("batterylevel")
         snap.focusMode = readStringLeaf("focusmode")
         snap.meteringMode = readStringLeaf("meteringmode")
-        // Camera datetime is exposed by libgphoto2's Canon EOS driver as a DATE
-        // widget at leaf `datetime` (value = Unix timestamp as Int via gp_widget_get_value).
-        // Best-effort: read as Int, convert to Date. If the widget is missing
-        // or non-numeric, leave nil.
-        if let leaf = leafByName("datetime") {
-            // DATE widget stores the value as an int (seconds since epoch).
-            var ts: Int32 = 0
-            let rc = withUnsafeMutablePointer(to: &ts) { ptr in
-                gp_widget_get_value(leaf, UnsafeMutableRawPointer(ptr))
-            }
-            if rc == GP_OK, ts > 0 {
-                snap.cameraDateTime = Date(timeIntervalSince1970: TimeInterval(ts))
-            }
+        // Bodies that expose a `datetime` leaf get it here (libgphoto2 2.5.33
+        // builds it as a DATE widget holding Unix seconds). The 7D has none, so
+        // this stays nil there. A leaf of any other type also leaves it nil.
+        if let leaf = leafByName("datetime"), let ts = try? WidgetHelpers.readDate(leaf), ts > 0 {
+            snap.cameraDateTime = Date(timeIntervalSince1970: TimeInterval(ts))
         }
         return snap
     }
@@ -176,7 +184,7 @@ public final class CameraProperties {
         }
     }
 
-    /// Read all picker choices in ONE config traversal. Same rationale as `snapshot()`.
+    /// Read all picker choices in one config traversal. Same rationale as `snapshot()`.
     public func choicesSnapshot() async throws -> ChoiceSet {
         let cam = try session.gpCamera()
         let ctx = try session.gpContext()
@@ -233,40 +241,30 @@ public final class CameraProperties {
         try await setString("aperture", value: value)
     }
 
-    public func whiteBalance() async throws -> String {
-        try await getString("whitebalance")
-    }
-
     public func setWhiteBalance(_ value: String) async throws {
         try await setString("whitebalance", value: value)
     }
 
-    public func whiteBalanceKelvin() async throws -> Int {
-        let s = try await getString("colortemperature")
-        return Int(s) ?? 0
-    }
-
     /// The white-balance mode in which `colortemperature` is the value the body
-    /// actually uses. Any other mode ignores it.
+    /// uses. Any other mode ignores it.
     ///
     /// `nonisolated` so the UI can compare against it without hopping to the
-    /// camera actor, it's a constant string, not camera state.
+    /// camera actor. It is a constant string, not camera state.
     public nonisolated static let colorTemperatureMode = "Color Temperature"
 
-    /// Set the body's colour temperature, **putting it into Color Temperature
-    /// mode first** so the value is the one actually applied.
+    /// Set the body's color temperature, putting it into Color Temperature
+    /// mode first so the value is the one applied.
     ///
-    /// Writing `colortemperature` on its own is close to useless and actively
-    /// harmful: the body keeps whatever white-balance mode it was in and quietly
-    /// derives its own temperature, so the number the app shows bears no
-    /// relation to the exposure. Alex measured it on the R5, a capture whose
-    /// EXIF recorded `Color Temperature: 5200` while `Color Temp As Shot` was
+    /// Writing `colortemperature` alone has no effect unless the body is in
+    /// Color Temperature mode: the body keeps whatever white-balance mode it
+    /// was in and derives its own temperature, so the number the app shows
+    /// bears no relation to the exposure. Measured on the R5: a capture whose EXIF
+    /// recorded `Color Temperature: 5200` while `Color Temp As Shot` was
     /// 2639, mode left on `Custom Whitebalance: PC-1`. Roughly a 2600K error
-    /// against a daylight light table, with no way to see or correct it from
-    /// the app.
+    /// against a daylight light table.
     ///
     /// Best-effort on the mode: bodies that don't expose the choice still get
-    /// the temperature written, which is no worse than before.
+    /// the temperature written, which is no worse than writing it alone.
     public func setWhiteBalanceKelvin(_ k: Int) async throws {
         try? await ensureColorTemperatureMode()
         try await setString("colortemperature", value: "\(k)")
@@ -275,13 +273,11 @@ public final class CameraProperties {
     /// Switch to Color Temperature white balance if the body offers it and
     /// isn't already there. Skipped silently when the choice doesn't exist.
     ///
-    /// The cheap read comes first, deliberately. Upstream fetches the choice
-    /// list before comparing, but our `choices(for:)` is uncached, it does a
-    /// full `gp_camera_get_config` + `resolveLeaf` every call, and this now
-    /// runs on every Kelvin write, which the UI drives from a Stepper. Holding
-    /// a stepper key would otherwise mean one full config read per repeat, over
-    /// USB2, with live view up. After the first write the mode already matches
-    /// and this returns on one `getString`.
+    /// The current mode is read first. `getString` and `choices(for:)` each
+    /// cost one full `gp_camera_get_config` (the cost table above), and this
+    /// runs on every Kelvin write, which the UI drives from a Stepper. After
+    /// the first write the mode already matches and this returns after the
+    /// one `getString`, without the `choices(for:)` read.
     private func ensureColorTemperatureMode() async throws {
         let current = try? await getString("whitebalance")
         if let current,
@@ -298,91 +294,77 @@ public final class CameraProperties {
         )
     }
 
-    /// Read the body's current metering mode. Values on the 7D:
-    /// "Evaluative" (default, full-frame averaged, weighted toward active AF
-    /// point), "Partial" (~6.5% center), "Spot" (~2.3% center, FIXED location),
-    /// "Center-weighted average" (whole frame, heavy center bias).
-    /// Note: spot meter location can NOT be changed via libgphoto2, the body
-    /// hard-codes it to the frame center on this firmware.
-    public func meteringMode() async throws -> String {
-        try await getString("meteringmode")
-    }
-
+    /// Values on the 7D: "Evaluative", "Partial", "Spot" and "Center-weighted
+    /// average". The spot meter sits at the frame center, and libgphoto2
+    /// cannot move it.
     public func setMeteringMode(_ value: String) async throws {
         try await setString("meteringmode", value: value)
     }
 
-    public func meteringModeChoices() async throws -> [String] {
-        try await choices(for: "meteringmode")
-    }
-
-    /// READ-ONLY, the 7D's exposure mode is set by the physical dial. Throws if you try to write.
+    /// The exposure mode. The 7D sets it on its physical mode dial, so there is
+    /// no setter.
     public func exposureMode() async throws -> String {
         // Some libgphoto2 builds expose this as `autoexposuremode`, others as `expprogram`.
-        // Try both; whichever resolves wins.
         do { return try await getString("autoexposuremode") } catch {}
         do { return try await getString("expprogram") } catch {}
         throw CameraError.propertyNotFound(name: "autoexposuremode/expprogram")
     }
-
-    public func isoChoices() async throws -> [String] { try await choices(for: "iso") }
-    public func shutterChoices() async throws -> [String] { try await choices(for: "shutterspeed") }
-    public func apertureChoices() async throws -> [String] { try await choices(for: "aperture") }
-    public func whiteBalanceChoices() async throws -> [String] { try await choices(for: "whitebalance") }
 
     // MARK: - Manual focus drive
 
     /// Direction + magnitude for a one-shot manual focus step. The 7D's
     /// libgphoto2 driver exposes `manualfocusdrive` as a RADIO with values
     /// "Near 1", "Near 2", "Near 3", "Far 1", "Far 2", "Far 3", "None".
-    /// Each step moves the lens motor a small/medium/large amount toward the
+    /// Each step moves the lens motor a fine/medium/coarse amount toward the
     /// near / far end. Multiple writes compound.
     public enum ManualFocusStep: String, Sendable, CaseIterable {
-        case nearTiny = "Near 1"   // smallest step toward near
+        case nearTiny = "Near 1"
         case nearSmall = "Near 2"
-        case nearLarge = "Near 3"  // largest step toward near
+        case nearLarge = "Near 3"
         case farTiny = "Far 1"
         case farSmall = "Far 2"
         case farLarge = "Far 3"
 
-        /// Signed magnitude for the client-side relative focus index. Near is
-        /// positive, Far negative; 1·2·3 are Canon's fine/medium/coarse presets
-        /// (NOT linear multiples, step 3 ≫ 3× step 1, and the exact lens travel
-        /// is undocumented and lens-dependent). A directional tracker for
-        /// repeatability, never a physical-distance measurement.
-        public var weight: Int {
-            switch self {
-            case .nearTiny:  return 1
-            case .nearSmall: return 2
-            case .nearLarge: return 3
-            case .farTiny:   return -1
-            case .farSmall:  return -2
-            case .farLarge:  return -3
+        /// The step a focus key asks for, or nil when the key is not one.
+        ///
+        /// Comma is far, period is near. Bare is medium, Option fine, Control
+        /// coarse (medium is the step used most, so it gets the bare key, and
+        /// the on-screen buttons keep their order). `chars` is
+        /// `charactersIgnoringModifiers`, which despite the name still applies
+        /// Shift, so a comma pressed while Shift holds the momentary punch-in
+        /// arrives as `<` (and period as `>`). Both forms are accepted so focus
+        /// can be stepped while zoomed in.
+        public static func forFocusKey(_ chars: String, option: Bool, control: Bool) -> ManualFocusStep? {
+            let near: Bool
+            switch chars {
+            case ",", "<": near = false
+            case ".", ">": near = true
+            default: return nil
             }
+            if control { return near ? .nearLarge : .farLarge }
+            if option  { return near ? .nearTiny : .farTiny }
+            return near ? .nearSmall : .farSmall
         }
     }
 
     /// Drive the lens focus motor one step in the requested direction.
     ///
-    /// Important preconditions for the motor to actually MOVE (the libgphoto2
-    /// write returns OK regardless, so silent no-ops are common if these
-    /// aren't met):
-    ///   • Lens switch must be set to AF (the EF lens motor is mechanically
-    ///     disconnected in MF, the body sends the drive command and the
-    ///     lens accepts it but nothing physical happens).
+    /// Preconditions for the motor to move (the libgphoto2 write returns OK
+    /// regardless, so silent no-ops are common if these aren't met):
+    ///   • Lens switch must be set to AF. The EF lens motor is mechanically
+    ///     disconnected in MF: the body sends the drive command and the lens
+    ///     accepts it, but nothing physical happens.
     ///   • Body focusmode should be a non-Manual mode (One Shot / AI Servo /
-    ///     AI Focus). If focusmode is Manual the body itself blocks the
-    ///     drive even with the lens switch set correctly. A prior capture can
-    ///     leave focusmode=Manual via the capture path, after which the body
-    ///     may stay there until the next mode change.
+    ///     AI Focus).
     ///   • Live view should be active. Some Canon bodies only accept
     ///     manualfocusdrive while EVF is up (mirror raised). The 7D in
     ///     particular ignores the command when the mirror is down.
+    ///
+    /// A Manual focusmode may be a body setting that blocks the drive, which
+    /// forcing One Shot fixes, or the lens switch on MF, which is how
+    /// AppAutofocus.blockedByLensSwitch reads it and where forcing One Shot
+    /// cannot help. Which reading holds on the 7D is not settled.
     public func driveManualFocus(_ step: ManualFocusStep) async throws {
-        // Force focusmode to "One Shot" before driving, this is what the
-        // body needs to honor manualfocusdrive. If focusmode is currently
-        // Manual (e.g. from a recent capture's focusmode-Manual write),
-        // the drive command would silently no-op. Best-effort.
         do {
             let current = try await getString("focusmode")
             if current.lowercased() == "manual" || current.isEmpty {
@@ -390,42 +372,14 @@ public final class CameraProperties {
                 try? await setString("focusmode", value: "One Shot")
             }
         } catch {
-            // focusmode read failed, proceed anyway, write may still work
         }
         try await setString("manualfocusdrive", value: step.rawValue)
     }
 
-    // MARK: - Focus mode
+    // MARK: - Exposure simulation
 
-    /// Current focus mode (libgphoto2 typically reports "One Shot", "AI Focus",
-    /// "AI Servo", "Manual" on Canon EOS bodies).
-    public func focusMode() async throws -> String {
-        try await getString("focusmode")
-    }
-
-    public func setFocusMode(_ value: String) async throws {
-        try await setString("focusmode", value: value)
-    }
-
-    public func focusModeChoices() async throws -> [String] {
-        try await choices(for: "focusmode")
-    }
-
-    // MARK: - AE lock / exposure simulation
-
-    /// Lock auto-exposure. While locked the body holds whatever it metered
-    /// at the time of the lock, subsequent captures use that exposure
-    /// instead of re-metering. Critical for avoiding the "captured image
-    /// is brighter than the LV preview" effect.
-    public func setAELock(_ locked: Bool) async throws {
-        // libgphoto2 exposes this as TOGGLE `aelock` on Canon EOS. Some
-        // bodies don't expose it at all (body has no AE-lock concept), in
-        // which case propertyNotFound is thrown and the caller can ignore.
-        try await writeToggleAction("aelock", value: locked ? 1 : 0)
-    }
-
-    /// Enable exposure simulation in EVF so the LV preview matches what the
-    /// body would actually capture. Default on the 7D is OFF (LV always shows
+    /// Turn exposure simulation in EVF on or off. On, the LV preview matches
+    /// what the body would capture. The 7D defaults to off (LV always shows an
     /// auto-gain'd image regardless of exposure settings).
     /// Returns silently if the widget isn't exposed by this libgphoto2 build.
     public func setExposureSimulation(_ enabled: Bool) async throws {
@@ -446,144 +400,101 @@ public final class CameraProperties {
                 continue
             }
         }
-        // Both leaf names missing, log and exit silently. Caller treats as
+        // Both leaf names missing: log and return. The caller treats this as
         // best-effort.
-        CameraLog.properties.info("exposure simulation widget not exposed; skipping")
+        CameraLog.properties.info("exposure simulation widget not exposed, skipping")
     }
 
     // MARK: - Image format (RAW / RAW+JPEG / JPEG / etc.)
-
-    public func imageFormat() async throws -> String {
-        try await getString("imageformat")
-    }
 
     public func setImageFormat(_ value: String) async throws {
         try await setString("imageformat", value: value)
     }
 
-    public func imageFormatChoices() async throws -> [String] {
-        try await choices(for: "imageformat")
-    }
-
-    // MARK: - Autofocus
-
-    /// Trigger a one-shot autofocus drive on the 7D. Two attempts:
-    ///   1. `autofocusdrive` TOGGLE → libgphoto2 maps to EOS_DoAf PTP op.
-    ///      The 7D body's PTP firmware decides whether it actually drives
-    ///      the lens motor based on focusmode + LV state.
-    ///   2. If that returns without an error but the lens didn't move
-    ///      (we can't detect that from libgphoto2's return code alone),
-    ///      fall back to `eosremoterelease` Press Half + Release Half.
-    /// Empirically the Press Half path only meters on the 7D, it doesn't
-    /// actually drive the lens. The autofocusdrive widget MAY work
-    /// where Press Half doesn't, they call different PTP opcodes.
-    public func triggerAutofocus() async throws {
-        // autofocusdrive toggle maps to PTP_DPC_CANON_EOS_AutoFocus on EOS
-        // bodies. Body responds by driving AF if focusmode is non-Manual
-        // and lens is AF.
-        //
-        // The cancelautofocus chaser was REMOVED because it undid the AF
-        // result: the motor runs but the body ends up out of focus and never
-        // succeeds at autofocus. Releasing body state isn't worth losing the
-        // focus. If AF still leaves the body in a stuck state, the right answer
-        // is to remove the AF button entirely (autofocus is optional).
-        do {
-            try await writeToggleAction("autofocusdrive", value: 1)
-            return
-        } catch CameraError.propertyNotFound {
-            // Widget missing, fall through to eosremoterelease path.
-        }
-        try await setString("eosremoterelease", value: "Press Half")
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        try await setString("eosremoterelease", value: "Release Half")
-    }
-
-    public func cancelAutofocus() async throws {
-        // Cancel via the dedicated widget if exposed; fall back to releasing
-        // any active half-press.
-        do {
-            try await writeToggleAction("cancelautofocus", value: 1)
-            return
-        } catch CameraError.propertyNotFound {}
-        try await setString("eosremoterelease", value: "Release Half")
-    }
-
     /// Sync the camera's clock with optional TZ-offset correction so saved
     /// CR2 files get EXIF DateTimeOriginal that matches host wall clock.
     ///
-    /// **Why this exists:** the 7D's `datetimeutc` widget writes the camera's
-    /// internal UTC. The body then derives EXIF DateTimeOriginal as
-    /// `internal_utc + camera_tz_menu`. If the camera's TZ menu setting doesn't
-    /// match the host's TZ, EXIF drifts by the delta. An exact 1-hour gap was
-    /// observed with the camera on PST (no DST) while the host was on PDT.
-    /// libgphoto2 exposes no widget for the
-    /// camera TZ menu so we can't read or fix it from software.
+    /// The 7D's `datetimeutc` widget writes the camera's internal UTC. The body
+    /// then derives EXIF DateTimeOriginal as `internal_utc + camera_tz_menu`.
+    /// If the camera's TZ menu setting doesn't match the host's TZ, EXIF drifts
+    /// by the delta. An exact 1-hour gap was observed with the camera on PST
+    /// (no DST) while the host was on PDT. libgphoto2 exposes no widget for the
+    /// camera TZ menu, so we can't read or fix it from software.
     ///
-    /// The 7D does NOT expose a plain `datetime` widget (only `datetimeutc`),
-    /// so the previous "write local-clock-as-pseudo-UTC" trick silently fell
-    /// back to vanilla syncdatetimeutc, leaving the drift in place.
+    /// The 7D does not expose a plain `datetime` widget (only `datetimeutc`),
+    /// so local wall time cannot be written through `datetime` on it. That is
+    /// why the write below targets `datetimeutc` with a corrected epoch.
     ///
-    /// **Verified on the R5 (2026-07-28).** That body exposes all four leaves,
+    /// Verified on the R5: that body exposes all four leaves,
     /// `settings/datetime`, `settings/datetimeutc`, `actions/syncdatetime`,
-    /// `actions/syncdatetimeutc`, and this function works there unmodified:
+    /// `actions/syncdatetimeutc`, and this function works there:
     /// a clock skewed by an hour was corrected to within a second, and EXIF
     /// DateTimeOriginal on the resulting CR3 matched host wall clock with a
-    /// correct -07:00 / Los Angeles / DST-on zone. `tzOffsetMinutes` is NOT
-    /// needed on the R5; leave it at 0.
+    /// correct -07:00 DST-on zone. `tzOffsetMinutes` is not needed on the
+    /// R5. Leave it at 0.
     ///
-    /// One R5 trap worth knowing: `settings/datetime` advertises `Readonly: 0`
-    /// but **silently ignores writes**, no error, value simply unchanged.
-    /// `settings/datetimeutc` is the one that actually takes, which is what we
-    /// write below. Don't "simplify" this to write `datetime`.
+    /// On the R5, `settings/datetime` reports `Readonly: 0` but ignores
+    /// writes: no error, and the value is unchanged. `settings/datetimeutc`
+    /// takes the write, which is why this writes it and not `datetime`.
     ///
-    /// Workaround: pass `tzOffsetMinutes` matching the camera's TZ-menu
-    /// delta from host. Camera on PST (-8), host on PDT (-7) → pass +60. The
-    /// write becomes `datetimeutc = host_utc + 60min`, the camera computes
-    /// local = `(host_utc + 60min) + (-480min) = host_utc - 420min` =
-    /// host_local. EXIF then matches Finder. tzOffsetMinutes=0 means "I've
-    /// already fixed the camera's TZ menu to match host" and is the proper
-    /// long-term fix.
+    /// The DST term is `CameraClock.datetimeUTCValue`. A body that keeps
+    /// its zone on standard time (the 7D) gets this Mac's DST offset added, so
+    /// the clock is right in summer as well as winter without the setting.
+    /// A camera on PST while this Mac is on PDT needs no offset: the DST term
+    /// already adds that hour, and passing +60 as well would add it twice.
+    ///
+    /// `tzOffsetMinutes` adds on top of that, for a camera whose zone is not
+    /// this Mac's standard time: pass this Mac's standard-time offset minus
+    /// the camera's zone offset, in minutes (a camera zone one hour east of
+    /// this Mac's standard time → -60). tzOffsetMinutes=0 means the camera's
+    /// zone already matches this Mac's standard time, which is the proper
+    /// long-term setting.
     public func syncDateTimeToHostLocal(tzOffsetMinutes: Int = 0) async throws {
         let now = Date()
-        let correctedEpoch = Int32(now.timeIntervalSince1970) + Int32(tzOffsetMinutes * 60)
-        // Try writing `datetimeutc` directly (the 7D's actual leaf, exposed
-        // as a DATE widget on this driver). If the body presents it as a
-        // TEXT widget instead (older libgphoto2 builds did), the action
-        // route below handles it.
+        let observesDST = CameraClock.observesDST(model: session.model)
+        let correctedEpoch = CameraClock.datetimeUTCValue(now: now, cameraObservesDST: observesDST,
+                                                          extraOffsetMinutes: tzOffsetMinutes)
+        CameraLog.properties.info("syncDateTimeToHostLocal: model \(self.session.model ?? "unread", privacy: .public), camera observes DST \(observesDST, privacy: .public), DST add \(observesDST ? 0 : Int(TimeZone.current.daylightSavingTimeOffset(for: now)), privacy: .public) s")
+        // Write `datetimeutc` directly (the 7D's leaf, a DATE widget on this
+        // driver). The syncdatetimeutc action below runs when the leaf is
+        // missing or is not a DATE widget.
         do {
-            try await writeIntAction("datetimeutc", value: correctedEpoch)
-            CameraLog.properties.info("syncDateTimeLocal: wrote datetimeutc=\(correctedEpoch, privacy: .public) (host_utc + \(tzOffsetMinutes, privacy: .public)min)")
+            try await writeInt32Leaf("datetimeutc", value: correctedEpoch)
+            CameraLog.properties.info("syncDateTimeToHostLocal: wrote datetimeutc=\(correctedEpoch, privacy: .public) (host_utc + DST term + \(tzOffsetMinutes, privacy: .public)min)")
             return
         } catch CameraError.widgetTypeMismatch, CameraError.propertyNotFound {
-            // Fall through to action-style sync.
         }
         try await writeToggleAction("syncdatetimeutc", value: 1)
-        CameraLog.properties.info("syncDateTimeLocal: datetimeutc write rejected, fired syncdatetimeutc action instead (TZ offset NOT applied)")
+        CameraLog.properties.info("syncDateTimeToHostLocal: no DATE datetimeutc leaf, fired syncdatetimeutc action instead (TZ offset not applied)")
     }
 
-    /// Legacy entry point, kept so callers that explicitly want UTC sync still
-    /// have it. New code should call `syncDateTimeToHostLocal()` because EXIF
-    /// timestamps want wall-clock parity, not zone-correct UTC.
+    /// Fires the syncdatetimeutc action (true UTC, no DST term). The debug
+    /// CLI's UTC clock sync uses it. The app uses `syncDateTimeToHostLocal()`
+    /// because EXIF timestamps want wall-clock parity, not zone-correct UTC.
     public func syncDateTimeToHost() async throws {
         try await writeToggleAction("syncdatetimeutc", value: 1)
     }
 
-    /// Write an Int-valued widget (used for the `datetime` DATE leaf which
-    /// libgphoto2 stores as Unix-seconds Int32).
-    private func writeIntAction(_ name: String, value: Int32) async throws {
+    /// Write an Int32 to a DATE leaf, which libgphoto2 stores as Unix seconds
+    /// (used for `datetimeutc`). Throws `widgetTypeMismatch` for a leaf that
+    /// is not a DATE widget, before anything is written.
+    private func writeInt32Leaf(_ name: String, value: Int32) async throws {
         let cam = try session.gpCamera()
         let ctx = try session.gpContext()
         let (root, leaf) = try WidgetHelpers.resolveLeaf(camera: cam, context: ctx, name: name)
         defer { gp_widget_unref(root) }
-        var v = value
-        try withUnsafeMutablePointer(to: &v) { ptr in
-            try CameraError.check(gp_widget_set_value(leaf, UnsafeMutableRawPointer(ptr)))
-        }
+        try WidgetHelpers.writeDate(leaf, value: value)
         try WidgetHelpers.commit(camera: cam, context: ctx, name: name, leaf: leaf)
     }
 
+    /// Public face of `writeToggleAction`, with no -110 retry.
+    public func writeToggle(_ name: String, value: Int32) async throws {
+        try await writeToggleAction(name, value: value)
+    }
+
+
     /// Write a TOGGLE-typed action leaf, the libgphoto2 convention for fire-once
-    /// actions like autofocusdrive, syncdatetimeutc, eosremoterelease, etc.
+    /// actions such as autofocusdrive, cancelautofocus and syncdatetimeutc.
     private func writeToggleAction(_ name: String, value: Int32) async throws {
         let cam = try session.gpCamera()
         let ctx = try session.gpContext()
@@ -602,13 +513,16 @@ public final class CameraProperties {
     // MARK: - Mode-aware write guards
 
     /// Returns true if a property is writable in the current exposure mode.
-    /// Mode dial conventions on the 7D:
+    /// The table is the 7D's mode-dial behavior. This function matches mode
+    /// names by substring and enforces only the Tv, Av and P rows: it returns
+    /// true for all three properties in any mode whose name contains none of
+    /// AV, APERTURE, TV, SHUTTER or P (B and Manual included).
     ///   M  → ISO, Tv, Av all writable
-    ///   Tv → ISO, Tv writable; Av is auto/read-only
-    ///   Av → ISO, Av writable; Tv is auto/read-only
-    ///   P  → ISO writable; Tv, Av auto/read-only
-    ///   B  → ISO writable; Tv = bulb (read-only); Av writable
-    ///   C1/C2/C3 → depends on stored custom mode; treat permissively
+    ///   Tv → ISO, Tv writable, Av is auto/read-only
+    ///   Av → ISO, Av writable, Tv is auto/read-only
+    ///   P  → ISO writable, Tv and Av auto/read-only
+    ///   B  → ISO writable, Tv = bulb (read-only), Av writable
+    ///   C1/C2/C3 → depends on stored custom mode, treat permissively
     public nonisolated static func isWritable(prop: String, inMode mode: String) -> Bool {
         let normalized = mode.uppercased()
         let isAvMode = normalized.contains("AV") || normalized.contains("APERTURE")
@@ -627,6 +541,15 @@ public final class CameraProperties {
         default:
             return true
         }
+    }
+
+    /// Whether a body event for `prop` carrying `value` moves that property's
+    /// picker in `mode`. An auto value always does. Any other value does only
+    /// where the property is writable in that mode (`isWritable`): elsewhere a
+    /// numeric shutter speed is the body's metered choice, not a setting.
+    public nonisolated static func pickerFollowsEvent(prop: String, mode: String, value: String) -> Bool {
+        if value.isEmpty || value.lowercased() == "auto" { return true }
+        return isWritable(prop: prop, inMode: mode)
     }
 
     private func assertWritableForExposureProp(_ prop: String) async throws {

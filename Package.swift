@@ -8,10 +8,17 @@ let package = Package(
         .executable(name: "FilmTether", targets: ["App"]),
         .library(name: "Camera", targets: ["Camera"]),
         .library(name: "Hotkey", targets: ["Hotkey"]),
-        // Scan is deliberately NOT a product. The auto-crop engine is real and
-        // tested, but nothing in the app calls it yet, only the debug CLI does.
-        // Advertising a library the app never uses invites someone to depend on
-        // an API that has not settled. It becomes a product when the app uses it.
+        // Scan is not a product. The app links it as a target, but it stays
+        // out of `products` because its API is still changing.
+    ],
+    dependencies: [
+        // film-sidecar reads and writes the <base>.xmp sidecar in the Film:
+        // namespace that Film Positive also uses. The path below names the
+        // copy this checkout builds against.
+        .package(path: "Packages/film-sidecar"),
+        // Sparkle checks for and installs updates, the one way every app of
+        // ours does it. The only dependency from outside the project.
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.10.0"),
     ],
     targets: [
         .systemLibrary(
@@ -33,12 +40,14 @@ let package = Package(
         ),
         .target(
             name: "Camera",
-            dependencies: ["CGPhoto2", "UsbReset"],
+            dependencies: [
+                "CGPhoto2", "UsbReset",
+                .product(name: "FilmSidecar", package: "film-sidecar"),
+            ],
             path: "Sources/Camera",
             linkerSettings: [
-                // Belt-and-suspenders for `ld`; pkg-config already provides -L for libgphoto2,
-                // but these don't hurt and they help if pkg-config ever fails.
-                // Note: unsafeFlags accepts absolute paths; .headerSearchPath does NOT.
+                // A fallback for `ld` if pkg-config fails. pkg-config already
+                // provides -L for libgphoto2.
                 .unsafeFlags(["-L/opt/homebrew/lib", "-L/usr/local/lib"]),
             ]
         ),
@@ -47,11 +56,10 @@ let package = Package(
             dependencies: [],
             path: "Sources/Hotkey"
         ),
-        // Film-scanning domain model: preview rotation, crop geometry, film
-        // negative sizes, and (later) the sidecar / REST payloads. Deliberately
-        // free of libgphoto2 and SwiftUI so it stays unit-testable, AppModel is
-        // @MainActor and window-server-bound, so none of this logic can be
-        // tested if it lives there.
+        // Film-scanning domain logic: preview transforms, the auto-crop
+        // detectors, the exposure advisor, sharpness scoring, white-balance
+        // gains and film sizes. Free of libgphoto2 and SwiftUI so it stays
+        // unit-testable.
         .target(
             name: "Scan",
             dependencies: [],
@@ -59,17 +67,17 @@ let package = Package(
         ),
         .executableTarget(
             name: "App",
-            dependencies: ["Camera", "Hotkey", "Scan"],
+            dependencies: ["Camera", "Hotkey", "Scan",
+                           .product(name: "FilmStyle", package: "film-sidecar"),
+                           .product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/App",
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"]),
             ]
         ),
-        // Headless CLI for running the Camera stack from a terminal. Used to
-        // exercise capture, live view, manual focus, metering, and EXIF
-        // verification without launching the SwiftUI app. Crucial for
-        // headless testing over SSH. The GUI app needs
-        // the OS window server, this doesn't.
+        // A CLI that drives the Camera stack from a terminal: capture, live
+        // view, manual focus and metering. Unlike the app it needs no window
+        // server, so it also runs over SSH.
         .executableTarget(
             name: "FilmTetherDebug",
             dependencies: ["Camera", "Scan"],
@@ -80,7 +88,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CameraTests",
-            dependencies: ["Camera"],
+            dependencies: ["Camera", "Hotkey", .product(name: "FilmSidecar", package: "film-sidecar")],
             path: "Tests/CameraTests"
         ),
         .testTarget(

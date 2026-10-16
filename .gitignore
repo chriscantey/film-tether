@@ -5,9 +5,9 @@ DerivedData/
 *.dSYM/
 .DS_Store
 xcuserdata/
-Package.resolved
-Film Tether.app/
+*.app/
 *.zip
 .compat-libs/
 .camlib-build/
 vendor/
+release-sources/

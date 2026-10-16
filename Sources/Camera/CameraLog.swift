@@ -9,12 +9,17 @@ import CGPhoto2
 ///
 ///     log stream --predicate 'subsystem == "co.wonders.filmtether"' --info --debug
 ///
-/// Set the env var `EOS_DEBUG=1` before launching the app (or use `make run-debug`)
-/// to enable verbose mode: every libgphoto2 internal log message is bridged into our
-/// system stream, and `.debug` messages from our own code are emitted (otherwise they
-/// drop). Errors and high-level state changes are always logged regardless of debug.
+/// `.debug` messages from our own code are kept whatever the environment, because
+/// the app's Info.plist sets OSLogPreferences to enable and persist Debug for this
+/// subsystem.
+///
+/// `EOS_DEBUG=1` before launch (or `make run-debug`) installs a libgphoto2 log
+/// callback that forwards its messages into the `gphoto2` category. With Homebrew's
+/// libgphoto2 that callback receives nothing: Homebrew configures it with
+/// `--disable-debug`, so libgphoto2_port compiles `gp_log_add_func` and `gp_log` as
+/// stubs. Only a libgphoto2 built with debugging delivers lines to it.
 public enum CameraLog {
-    private static let subsystem = "co.wonders.filmtether"
+    private static let subsystem = LogExportPlan.subsystem
 
     public static let connection = Logger(subsystem: subsystem, category: "Connection")
     public static let session = Logger(subsystem: subsystem, category: "Session")
@@ -30,10 +35,11 @@ public enum CameraLog {
     }
 
     /// One-time install of a libgphoto2 log callback that pipes its internal logging
-    /// into our unified-log stream. Called from `AppLaunch.bootstrap`.
+    /// into our unified-log stream, when `EOS_DEBUG=1` (see the type doc for when it
+    /// receives anything). Called from `AppLaunch.bootstrap`.
     public static func installGphotoLogBridge() {
         guard isDebug else { return }
-        // GP_LOG_DATA = everything (very verbose). For less noise, use GP_LOG_DEBUG.
+        // Registered at GP_LOG_DEBUG, so GP_LOG_DATA lines are never delivered.
         gp_log_add_func(GP_LOG_DEBUG, { level, domain, message, _ in
             let d = domain.map { String(cString: $0) } ?? "?"
             let m = message.map { String(cString: $0) } ?? "?"
