@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://filmtether.app">Website</a>
   &nbsp;&middot;&nbsp;
-  <a href="https://github.com/chriscantey/film-tether/releases/latest">Download</a>
+  <a href="https://github.com/chriscantey/film-tether/releases/latest/download/FilmTether.zip">Download</a>
   &nbsp;&middot;&nbsp;
   <a href="https://filmpositive.app">See Film Positive</a>
 </p>
@@ -80,7 +80,7 @@ One thing worth knowing first. This repo is a published copy of a private workin
 
 ## Install
 
-Grab the latest build from [Releases](https://github.com/chriscantey/film-tether/releases), unzip it, and open it.
+[Download the latest build](https://github.com/chriscantey/film-tether/releases/latest/download/FilmTether.zip), unzip it, and open it. Older versions are on the [Releases](https://github.com/chriscantey/film-tether/releases) page.
 
 If you let it (Settings > Updates), the app checks filmtether.app once a day for a new version. It's a standard HTTPS request with a User-Agent header like `Film Tether/0.4.0 Sparkle/2.10.0`, and nothing else. As with any web request, the server can see your IP address.
 
