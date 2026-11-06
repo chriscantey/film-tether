@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Sign a framework inside a bundle, inside out, so the bundle can be signed
-# after it. Written for Sparkle (the shared update standard, _AppUpdates 2b),
-# where the framework carries its own XPC services, a helper tool and a helper
-# app, each of which must be signed on its own before the framework and the
-# app that holds it. Under the hardened runtime and library validation an
+# after it. Written for Sparkle, where the framework carries its own XPC
+# services, a helper tool and a helper app, each of which must be signed on its
+# own before the framework and the app that holds it. Under the hardened runtime and library validation an
 # unsigned or foreign-signed piece inside the framework stops the app at
 # launch, and notarization refuses it.
 #
-#   tools/sign-framework.sh <identity> <App.app> <Name.framework> [codesign args...]
+#   sign-framework.sh <identity> <App.app> <Name.framework> [codesign args...]
 #
 # With a Developer ID identity every piece gets the hardened runtime and a
 # secure timestamp. With "-" (ad hoc, a dev bundle) neither applies. Any
@@ -21,9 +20,8 @@
 # --deep, which would put one piece's entitlements on the others. The app is
 # signed after this, by the caller, also without --deep.
 #
-# This is the shared copy, proven end to end on the Home Video pilot. Each app
-# vendors it unchanged; a public-image scan rejects a path it does not ship, so
-# this comment names no app's own tree.
+# Every app that bundles Sparkle carries this file unchanged, so it names no
+# app's own tree.
 set -euo pipefail
 IDENTITY="${1:?identity}"; APP="${2:?App.app}"; NAME="${3:?Name.framework}"
 shift 3

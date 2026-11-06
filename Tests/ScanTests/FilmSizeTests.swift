@@ -27,6 +27,7 @@ final class FilmSizeTests: XCTestCase {
             13: 41.5 / 56,          // 120 6x4.5
             14: 70.0 / 56,          // 120 6x7
             15: 17.0 / 13,          // 110
+            16: 72.0 / 35,          // 35mm pano, across the whole strip
         ]
         let rows = FilmSize.seedCatalog + FilmSize.pickerOnlyRows
         XCTAssertEqual(Set(rows.map(\.id)), Set(expected.keys))
@@ -59,6 +60,7 @@ final class FilmSizeTests: XCTestCase {
             13: 56 / 41.5,
             14: 70.0 / 56,
             15: 17.0 / 13,
+            16: 72.0 / 35,
         ]
         let rows = FilmSize.seedCatalog + FilmSize.pickerOnlyRows
         XCTAssertEqual(Set(rows.map(\.id)), Set(expected.keys))
@@ -89,8 +91,8 @@ final class FilmSizeTests: XCTestCase {
 
     func testThePickerOffersTheSizeList() {
         let names = FilmSize.pickerSizes(including: nil).map(\.displayName)
-        XCTAssertEqual(names, ["Not set", "35mm", "35mm Half", "35mm Slide", "120 6x4.5", "120 6x6",
-                               "120 6x7", "120 6x9", "4x5", "110"])
+        XCTAssertEqual(names, ["Not set", "35mm", "35mm Half", "35mm Pano", "35mm Slide", "120 6x4.5",
+                               "120 6x6", "120 6x7", "120 6x9", "4x5", "110"])
     }
 
     func testNoPickerNameCarriesABrandOr120mm() {
@@ -137,8 +139,8 @@ final class FilmSizeTests: XCTestCase {
     func testAHiddenSelectionStillShows() throws {
         let fiveBySeven = try XCTUnwrap(FilmSize.resolve(id: 9))
         XCTAssertEqual(FilmSize.pickerSizes(including: fiveBySeven).last?.id, 9)
-        XCTAssertEqual(FilmSize.pickerSizes(including: FilmSize.resolve(id: 4)).count, 10, "no duplicate row")
-        XCTAssertEqual(FilmSize.pickerSizes(including: FilmSize.unknown).count, 10)
+        XCTAssertEqual(FilmSize.pickerSizes(including: FilmSize.resolve(id: 4)).count, 11, "no duplicate row")
+        XCTAssertEqual(FilmSize.pickerSizes(including: FilmSize.unknown).count, 11)
     }
 
     func testEveryPickerIdResolves() {
@@ -157,6 +159,17 @@ final class FilmSizeTests: XCTestCase {
         XCTAssertTrue(FilmSize.detectionMayReplace(thirtyFive, other: false, with: fourByFive), "a catalog row may be replaced by a different shape")
         XCTAssertTrue(FilmSize.detectionMayReplace(nil, other: false, with: fourByFive))
         XCTAssertFalse(FilmSize.detectionMayReplace(thirtyFive, other: false, with: FilmSize.unknown))
+    }
+
+    /// No catalog row has the pano's shape, so the matcher can never confirm it, and a
+    /// match of any other shape is a misread rather than a reason to change the choice.
+    func testTheDetectorNeverOverridesThePano() throws {
+        let pano = try XCTUnwrap(FilmSize.resolve(id: 16))
+        XCTAssertEqual(pano.displayName, "35mm Pano")
+        XCTAssertEqual(try XCTUnwrap(pano.alongOverAcross), 72.0 / 35, accuracy: 1e-9)
+        for match in FilmSize.seedCatalog where !match.isUnknown {
+            XCTAssertFalse(FilmSize.detectionMayReplace(pano, other: false, with: match), match.name)
+        }
     }
 
     func testOnlyUnknownLacksDimensions() {

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Write the update keys and the version string into a bundle's Info.plist for
-# one line, per the shared update standard. Run after the build number is
-# stamped into CFBundleVersion, before signing.
+# one line. Run after the build number is stamped into CFBundleVersion, before
+# signing.
 #
 #   scripts/updates-plist.sh <Info.plist> <release|beta|none>
 #
 #   release  the public feed on the site, version "0.4.0"
 #   beta     the unlisted feed from the environment, version "0.4.0 beta N"
-#   none     no feed, no updater, version "Dev 0.4.0 (61)"; a dev build never
-#            checks for updates
+#   none     no feed, no updater, version "Dev 0.4.0 (<CFBundleVersion>)", and a
+#            dev build never checks for updates
 #
 # Env for the beta line, both required: FT_BETA_FEED_URL (the unlisted feed, which
 # never lives in this repository) and FT_BETA_NUMBER (the N above).

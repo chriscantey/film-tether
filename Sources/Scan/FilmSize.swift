@@ -115,6 +115,8 @@ public struct FilmSize: Identifiable, Equatable, Codable, Sendable {
         FilmSize(id: 13, name: "120 6x4.5", widthMM: 41.5, heightMM: 56),
         FilmSize(id: 14, name: "120 6x7",   widthMM: 56,   heightMM: 70),
         FilmSize(id: 15, name: "110",       widthMM: 13,   heightMM: 17),
+        // A panorama exposed across the whole strip, sprocket holes included: 72 x 35 mm.
+        FilmSize(id: 16, name: "35mm Pano", widthMM: 35,   heightMM: 72),
     ]
 
     /// The formats the metadata bar's Size picker offers, in menu order, by
@@ -122,7 +124,7 @@ public struct FilmSize: Identifiable, Equatable, Codable, Sendable {
     /// (8x10, 11x14, 5x7, 3.25x4.25, 2.25x3.25) still resolve by id, for
     /// sidecars already written and for the matcher, and a hidden row the
     /// matcher picks still shows while it is the selection.
-    public static let pickerIDs: [Int] = [4, 12, 5, 13, 2, 14, 8, 3, 15]
+    public static let pickerIDs: [Int] = [4, 12, 16, 5, 13, 2, 14, 8, 3, 15]
 
     /// Any id Tether knows, from the catalog or the picker's own rows.
     public static func resolve(id: Int) -> FilmSize? {
@@ -157,12 +159,16 @@ public struct FilmSize: Identifiable, Equatable, Codable, Sendable {
     /// The matcher knows only `seedCatalog`, so it cannot confirm a picker-only
     /// row: a 6x7 frame matches 4x5, the same shape. A chosen picker-only row
     /// stays when the match has its shape (within 2%), and Other is never
-    /// replaced, since the person typed what the list lacks. A chosen catalog
-    /// row is replaceable by any match that is not unknown.
+    /// replaced, since the person typed what the list lacks. Nor is a chosen
+    /// picker-only row whose shape no catalog row shares, such as the pano: the
+    /// matcher can never find that shape, so whatever it does find is a misread.
+    /// A chosen catalog row is replaceable by any match that is not unknown.
     public static func detectionMayReplace(_ current: FilmSize?, other: Bool, with match: FilmSize) -> Bool {
         guard !match.isUnknown, !other else { return false }
         guard let c = current, pickerOnlyRows.contains(where: { $0.id == c.id }),
               let a = c.aspectRatio, let b = match.aspectRatio else { return true }
+        let matchable = seedCatalog.contains { $0.aspectRatio.map { abs(a / $0 - 1) <= 0.02 } ?? false }
+        guard matchable else { return false }
         return abs(a / b - 1) > 0.02
     }
 

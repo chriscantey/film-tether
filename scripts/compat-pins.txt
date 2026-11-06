@@ -10,6 +10,12 @@
 # (macOS 26).
 jpeg-turbo sonoma c1a02c5e74d687402700645d60f7045485d88ed9f2f615d301d1b081ad1e1f66
 
+# jpeg-turbo 3.2.0 Apple Silicon Sonoma: the 3.2.1 update (homebrew-core
+# a1f9d8a7c3, bottles 6779726fba) has no Sonoma tag. The last revision that
+# listed it is bd9393662c (3.2.0 rebuild 1). Keeps the arm64 slice on 3.2.0,
+# the version the Intel slice and the notices carry.
+jpeg-turbo arm64_sonoma 3ff48858f9042df4ce6ca4bf4006bae5e46f919037cba077f0c81a1f6e0a288a
+
 # gettext 1.0 (libintl.8) Sonoma, both arches: the rebuild 2 bottle update
 # (homebrew-core e78efec19e) dropped every Sonoma tag and Intel entirely. The
 # last revision listing them is 5c728a8378 (rebuild 1). Without these no

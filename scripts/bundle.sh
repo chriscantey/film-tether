@@ -56,8 +56,8 @@ cp "$BINARY" "$BUNDLE/Contents/MacOS/$EXEC"
 cp Resources/Info.plist "$BUNDLE/Contents/Info.plist"
 
 # Sparkle, the update framework, built by SwiftPM beside the executable as a
-# binary framework. The whole framework goes in, XPC services and helpers
-# inside; scripts/sign-framework.sh signs it inside out below.
+# binary framework. The whole framework goes in with its XPC services and
+# helpers, and scripts/sign-framework.sh signs it inside out below.
 SRC_FW="$(dirname "$BINARY")/Sparkle.framework"
 [[ -d "$SRC_FW" ]] || { echo "FATAL: $SRC_FW not found beside the executable (swift build puts it there)" >&2; exit 1; }
 cp -R "$SRC_FW" "$BUNDLE/Contents/Frameworks/Sparkle.framework"
