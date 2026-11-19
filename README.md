@@ -63,7 +63,7 @@ Film Tether sticks to tethered capture. Its companion app, [Film Positive](https
 
 ## Supported cameras
 
-Tested on a Canon EOS 7D (by me), a 70D and an R5 (by contributors). That is the whole list so far. It should work with other EOS bodies that [libgphoto2 supports](http://www.gphoto.org/proj/libgphoto2/support.php), but I have not tried them. If you run it on another body, [tell me on the repo](https://github.com/chriscantey/film-tether/issues) and I will add it here.
+Tested on a Canon EOS 7D by me, and by contributors on a 70D, an R5 and a 1000D (Rebel XS). That is the whole list so far. It should work with other EOS bodies that [libgphoto2 supports](http://www.gphoto.org/proj/libgphoto2/support.php), but I have not tried them. If you run it on another body, [tell me on the repo](https://github.com/chriscantey/film-tether/issues) and I will add it here.
 
 ## Contributors
 
@@ -71,6 +71,7 @@ People who have put work into this, and what they did. Huge thanks to everyone h
 
 - [@eileendarby](https://github.com/eileendarby). Canon R5 support, and most of the film-scanning preview work in 0.3.0: invert, black and white, click-to-set white balance, preview rotation, the Fit zoom mode, and the menu bar fixes. In 0.4.0, the crop box with its handles and straightening, the WB Mode picker, the fix for the status bar clock and the Live View lamp.
 - [Melody Murray](https://melodymurray.com). Testing on the Canon EOS 70D, which is the only reason that body is on the supported list.
+- [@afreedma](https://github.com/afreedma). Testing on the Canon EOS 1000D (Rebel XS), reported in [#2](https://github.com/chriscantey/film-tether/issues/2).
 
 ## Contributing
 
